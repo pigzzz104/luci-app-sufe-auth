@@ -56,6 +56,7 @@ luci-app-sufe-auth/
 │       └── sbin/
 │           └── sufe_auth                  # 802.1X 认证核心程序
 ├── tools/
+│   ├── configure_mwan3.sh                 # 实用工具：MWAN3 策略路由一键优化配置脚本
 │   └── restore_ipv6.sh                    # 实用工具：一键还原 IPv6 配置
 ├── install.sh                             # 路由器一键安装脚本
 ├── uninstall.sh                           # 卸载脚本
@@ -129,11 +130,22 @@ make package/luci-app-sufe-auth/compile V=s
    - 其余物理网口通过 Switch VLAN（`swconfig` 或 DSA 交换架构）划分为独立的外部网络接口（如 `eth1` 为 WAN1，`eth0.2` 为 WAN2）。
 2. **多账号认证**：
    - 在本插件内为各接口分别添加配置并启动认证。各接口握手成功后通过 DHCP 获取到各自的内网 IP。
-3. **负载均衡与防掉线配置（MWAN3）**：
-   - 在 `mwan3` 中配置接口监控（ping 测试推荐检测校园网网关或公共 DNS）。
-   - **会话粘性（Sticky）**：针对 HTTPS (443 端口) 启用 Sticky 规则，避免访问网页和登录服务时因出口 IP 变动导致凭证失效。
-   - **游戏与低延迟业务**：针对 UDP 流量或特定游戏端口，配置路由规则固定从单条主力线路走，防止多线并发出错。
-   - **下载与流媒体**：针对常规 HTTP/多线程下载流量采用平衡策略（Balanced），享受多线带宽叠加。
+3. **策略路由配置（提供一键脚本）**：
+   为降低多线分流配置门槛，仓库在 `tools/` 目录下提供了基于实战调优的配置脚本 `tools/configure_mwan3.sh`：
+   - 自动为 `wan`、`wan2`、`wan3` 写入互不冲突的路由跃点 Metric (10/20/30)。
+   - 自动关联防火墙 WAN 区域。
+   - 写入阿里/腾讯双公共 DNS (223.5.5.5, 119.29.29.29) 链路健康检测。
+   - 游戏与语音常见 UDP 端口启用 IP 粘性（Sticky）并优先走主 WAN，杜绝游戏掉线。
+   - 常规流量与多线程下载采用平衡策略（Balanced），实现带宽并发叠加。
+
+   在路由器终端执行以下命令即可一键应用该策略：
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/pigzzz104/luci-app-sufe-auth/master/tools/configure_mwan3.sh | sh
+   ```
+   或在克隆仓库后执行：
+   ```bash
+   sh tools/configure_mwan3.sh
+   ```
 
 ---
 
