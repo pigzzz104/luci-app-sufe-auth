@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SUFE Campus Network 802.1X Authentication Daemon
+Specifically created for Shanghai University of Finance and Economics (SUFE)
+Supports:
+  - IEEE 802.1X EAPOL (Unicast & Multicast)
+  - Huawei/H3C EAP-PAP / Allocation (Type 7)
+  - Periodic keep-alive re-auth handling
+  - Physical link carrier monitoring & auto-reconnect
+  - OpenWrt UCI configuration & Procd service management
+"""
+
+import sys
+import os
+import time
+import socket
+import struct
+import signal
+import syslog
+import subprocess
+import argparse
+
+ETHERTYPE_EAPOL = 0x888e
+PAE_GROUP = bytes.fromhex("0180c2000003")
+BROADCAST_MAC = bytes.fromhex("ffffffffffff")
+DEFAULT_SWITCH_MAC = bytes.fromhex("58aea8880c31")
+
+EAPOL_EAPPACKET = 0
+EAPOL_START = 1
+EAPOL_LOGOFF = 2
+
+EAP_REQUEST = 1
+EAP_RESPONSE = 2
+EAP_SUCCESS = 3
+EAP_FAILURE = 4
+
+EAP_TYPE_ID = 1
+EAP_TYPE_MD5 = 4
+EAP_TYPE_H3C = 7
+
+running = True
+debug_mode = False
+
+current_instance = "default"
+
+def log(msg, level=syslog.LOG_INFO):
+    prefix = f"[sufe_auth:{current_instance}] "
+    if debug_mode or not is_daemon:
+        print(prefix + msg, flush=True)
+    try:
+        syslog.syslog(level, msg)
+    except Exception:
+        pass
+
+def get_uci_option(package, section, option, default=""):
+    try:
+        res = subprocess.check_output(["uci", "get", f"{package}.{section}.{option}"], stderr=subprocess.DEVNULL)
+        return res.decode("utf-8").strip()
+    except Exception:
+        return default
+
+def get_mac_bytes(ifname):
+    try:
+        with open(f"/sys/class/net/{ifname}/address", "r") as f:
+            mac_str = f.read().strip()
+            return bytes.fromhex(mac_str.replace(":", ""))
+    except Exception as e:
+        log(f"Failed to read MAC for {ifname}: {e}", syslog.LOG_ERR)
+        return None
+
+def set_mac(ifname, mac_str):
+    try:
+        if not mac_str or not mac_str.strip():
+            return True
+        mac_str = mac_str.strip().lower()
+        curr_mac = get_mac_bytes(ifname)
+        if curr_mac:
+            target_mac = bytes.fromhex(mac_str.replace(":", ""))
+            if curr_mac == target_mac:
+                return True
+        log(f"Setting MAC address of {ifname} to {mac_str}")
+        subprocess.run(["ip", "link", "set", ifname, "down"], check=True)
+        subprocess.run(["ip", "link", "set", ifname, "address", mac_str], check=True)
+        subprocess.run(["ip", "link", "set", ifname, "up"], check=True)
+        time.sleep(2)
+        return True
+    except Exception as e:
+        log(f"Error setting MAC address: {e}", syslog.LOG_ERR)
+        return False
+
+def is_carrier_up(ifname):
+    try:
+        with open(f"/sys/class/net/{ifname}/carrier", "r") as f:
+            return f.read().strip() == "1"
+    except Exception:
+        return False
+
+class SufeAuthClient:
+    def __init__(self, ifname, username, password, target_mac=None, switch_mac=None, network="wan", instance_name=""):
+        global current_instance
+        self.ifname = ifname
+        self.username = username
+        self.password = password
+        self.target_mac = target_mac
+        self.switch_mac = switch_mac or DEFAULT_SWITCH_MAC
+        self.network = network or "wan"
+        self.instance_name = instance_name or ifname
+        current_instance = self.instance_name
+        self.sock = None
+        self.my_mac = None
+        self.is_authenticated = False
+        self.last_auth_time = 0
+
+    def init_socket(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+        if self.target_mac and len(self.target_mac.strip()) > 0:
+            set_mac(self.ifname, self.target_mac.strip())
+
+        self.my_mac = get_mac_bytes(self.ifname)
+        if not self.my_mac:
+            raise RuntimeError(f"Cannot get MAC for {self.ifname}")
+
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETHERTYPE_EAPOL))
+        self.sock.bind((self.ifname, 0))
+        self.sock.settimeout(2.0)
+        log(f"Initialized raw socket on {self.ifname} (MAC: {self.my_mac.hex(':')})")
+
+    def send_frame(self, dst_mac, eapol_type, payload=b""):
+        if not self.sock:
+            return
+        eth_hdr = dst_mac + self.my_mac + struct.pack("!H", ETHERTYPE_EAPOL)
+        eapol_hdr = struct.pack("!BBH", 1, eapol_type, len(payload))
+        frame = eth_hdr + eapol_hdr + payload
+        try:
+            self.sock.send(frame)
+        except Exception as e:
+            log(f"Error sending frame: {e}", syslog.LOG_ERR)
+
+    def send_eap_response(self, dst_mac, pkt_id, req_type, data=b""):
+        eap_len = 5 + len(data)
+        eap_pkt = struct.pack("!BBHB", EAP_RESPONSE, pkt_id, eap_len, req_type) + data
+        self.send_frame(dst_mac, EAPOL_EAPPACKET, eap_pkt)
+
+    def send_start(self):
+        log(f"Sending EAPOL-Start (unicast to {self.switch_mac.hex(':')} & multicast)")
+        self.send_frame(self.switch_mac, EAPOL_START)
+        self.send_frame(PAE_GROUP, EAPOL_START)
+
+    def send_logoff(self):
+        log("Sending EAPOL-Logoff")
+        if self.switch_mac:
+            self.send_frame(self.switch_mac, EAPOL_LOGOFF)
+        self.send_frame(PAE_GROUP, EAPOL_LOGOFF)
+
+    def trigger_dhcp(self):
+        log(f"Authentication successful! Triggering DHCP on interface '{self.network}'...")
+        try:
+            # Check if interface already has an assigned IPv4 address
+            has_ip = subprocess.run(f"ip -4 addr show dev {self.ifname} 2>/dev/null | grep -q 'inet '", shell=True).returncode == 0
+            if has_ip:
+                # If we already hold a lease, renew smoothly without resetting device
+                subprocess.run(["ubus", "call", f"network.interface.{self.network}", "renew"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                # If no IP lease yet, bring interface up to force DHCP discover broadcast
+                subprocess.run(["ifup", self.network], check=False)
+        except Exception as e:
+            log(f"Failed to trigger DHCP on {self.network}: {e}", syslog.LOG_WARNING)
+
+    def authenticate_loop(self):
+        max_attempts = 5
+        attempt = 0
+        self.is_authenticated = False
+
+        while running and attempt < max_attempts:
+            attempt += 1
+            log(f"Authentication attempt {attempt}/{max_attempts}...")
+            self.send_start()
+
+            start_t = time.time()
+            while running and (time.time() - start_t < 6):
+                try:
+                    pkt = self.sock.recv(1600)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    log(f"Socket recv error: {e}", syslog.LOG_ERR)
+                    break
+
+                if len(pkt) < 18:
+                    continue
+
+                src = pkt[6:12]
+                eth_type = struct.unpack("!H", pkt[12:14])[0]
+                if eth_type != ETHERTYPE_EAPOL or src == self.my_mac:
+                    continue
+
+                self.switch_mac = src
+                version, eapol_type, eapol_len = struct.unpack("!BBH", pkt[14:18])
+                if eapol_type != EAPOL_EAPPACKET or len(pkt) < 22:
+                    continue
+
+                eap_code, eap_id, eap_pkt_len = struct.unpack("!BBH", pkt[18:22])
+                eap_data = pkt[22:18+eap_pkt_len]
+
+                if eap_code == EAP_SUCCESS:
+                    log(f"EAP Authentication SUCCESS! Server ID: {eap_id}")
+                    self.is_authenticated = True
+                    self.last_auth_time = time.time()
+                    self.trigger_dhcp()
+                    return True
+
+                elif eap_code == EAP_FAILURE:
+                    log(f"EAP Authentication FAILURE from switch! ID: {eap_id}", syslog.LOG_ERR)
+                    time.sleep(3)
+                    break
+
+                elif eap_code == EAP_REQUEST:
+                    if len(eap_data) < 1:
+                        continue
+                    req_type = eap_data[0]
+                    req_body = eap_data[1:]
+
+                    if req_type == EAP_TYPE_ID:
+                        log(f"Responding to EAP-Request/Identity with {self.username}")
+                        self.send_eap_response(self.switch_mac, eap_id, EAP_TYPE_ID, self.username.encode("utf-8"))
+
+                    elif req_type == EAP_TYPE_H3C:
+                        log("Responding to EAP-Request/Type 7 (PAP) with password")
+                        pap_payload = bytes([len(self.password)]) + self.password.encode("utf-8") + self.username.encode("utf-8")
+                        self.send_eap_response(self.switch_mac, eap_id, EAP_TYPE_H3C, pap_payload)
+
+                    elif req_type == EAP_TYPE_MD5:
+                        log("Warning: Received EAP-Request/MD5 challenge, replying standard MD5 payload")
+                        # fallback if ever needed
+                        md5_data = req_body[1:17] if len(req_body) > 17 else req_body
+                        import hashlib
+                        m = hashlib.md5(bytes([eap_id]) + self.password.encode("utf-8") + md5_data).digest()
+                        resp = bytes([len(m)]) + m + self.username.encode("utf-8")
+                        self.send_eap_response(self.switch_mac, eap_id, EAP_TYPE_MD5, resp)
+
+                    else:
+                        log(f"Unknown EAP Request Type: {req_type}")
+
+            time.sleep(1)
+
+        return self.is_authenticated
+
+    def monitor_loop(self):
+        log("Entering monitoring & keepalive loop...")
+        last_carrier_check = time.time()
+        last_ping_check = time.time()
+        last_keepalive_log = 0
+        fail_count = 0
+
+        while running:
+            # 1. Listen for switch packets (re-authentication requests)
+            try:
+                pkt = self.sock.recv(1600)
+                if len(pkt) >= 22:
+                    src = pkt[6:12]
+                    eth_type = struct.unpack("!H", pkt[12:14])[0]
+                    if eth_type == ETHERTYPE_EAPOL and src != self.my_mac:
+                        eapol_type = pkt[15]
+                        if eapol_type == EAPOL_EAPPACKET:
+                            eap_code, eap_id, eap_pkt_len = struct.unpack("!BBH", pkt[18:22])
+                            eap_data = pkt[22:18+eap_pkt_len]
+                            if eap_code == EAP_REQUEST and len(eap_data) >= 1:
+                                req_type = eap_data[0]
+                                now_t = time.time()
+                                if now_t - last_keepalive_log >= 300:
+                                    last_keepalive_log = now_t
+                                    log(f"Handling periodic EAP-Request heartbeat (ID {eap_id})")
+                                if req_type == EAP_TYPE_ID:
+                                    self.send_eap_response(src, eap_id, EAP_TYPE_ID, self.username.encode("utf-8"))
+                                elif req_type == EAP_TYPE_H3C:
+                                    pap_payload = bytes([len(self.password)]) + self.password.encode("utf-8") + self.username.encode("utf-8")
+                                    self.send_eap_response(src, eap_id, EAP_TYPE_H3C, pap_payload)
+                            elif eap_code == EAP_SUCCESS:
+                                self.is_authenticated = True
+                                self.last_auth_time = time.time()
+            except socket.timeout:
+                pass
+            except Exception as e:
+                log(f"Socket error in monitor: {e}, re-initializing raw socket...", syslog.LOG_WARNING)
+                time.sleep(1)
+                try:
+                    self.init_socket()
+                except Exception as ie:
+                    log(f"Re-init socket error: {ie}", syslog.LOG_WARNING)
+
+            # 2. Check physical carrier every 10 seconds
+            now = time.time()
+            if now - last_carrier_check >= 10:
+                last_carrier_check = now
+                parent_if = self.ifname.split(".")[0] if "." in self.ifname else self.ifname
+                if not is_carrier_up(self.ifname) and not is_carrier_up(parent_if):
+                    log(f"Physical link carrier DOWN on {self.ifname}! Waiting for link...", syslog.LOG_WARNING)
+                    self.is_authenticated = False
+                    while running and not is_carrier_up(self.ifname) and not is_carrier_up(parent_if):
+                        time.sleep(2)
+                    if running:
+                        log(f"Physical link restored on {self.ifname}! Re-authenticating...")
+                        self.init_socket()
+                        self.authenticate_loop()
+                        continue
+
+            # 3. Check connectivity every 60 seconds
+            if self.is_authenticated and (now - last_ping_check >= 60):
+                last_ping_check = now
+                # Check if interface has an IPv4 address before pinging
+                has_ip = subprocess.run(f"ip -4 addr show dev {self.ifname} | grep -q 'inet '",
+                                        shell=True).returncode == 0
+                if not has_ip:
+                    log(f"{self.ifname} has no IPv4 lease yet, triggering DHCP renew...", syslog.LOG_WARNING)
+                    self.trigger_dhcp()
+                else:
+                    res = subprocess.run(["ping", "-c", "1", "-W", "2", "-I", self.ifname, "223.5.5.5"],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if res.returncode == 0:
+                        fail_count = 0
+                    else:
+                        fail_count += 1
+                        log(f"Connectivity check failed ({fail_count}/3)", syslog.LOG_WARNING)
+                        if fail_count >= 3:
+                            log("Connectivity lost! Triggering re-authentication...", syslog.LOG_ERR)
+                            fail_count = 0
+                            self.init_socket()
+                            self.authenticate_loop()
+
+    def run(self):
+        while running:
+            try:
+                self.init_socket()
+                if self.authenticate_loop():
+                    self.monitor_loop()
+                else:
+                    log("Authentication failed, retrying in 10 seconds...", syslog.LOG_WARNING)
+                    time.sleep(10)
+            except Exception as e:
+                log(f"Unhandled error in run: {e}", syslog.LOG_ERR)
+                time.sleep(5)
+
+        self.send_logoff()
+        if self.sock:
+            self.sock.close()
+        log("SUFE Auth client terminated.")
+
+def sig_handler(signum, frame):
+    global running
+    log(f"Received signal {signum}, stopping...")
+    running = False
+
+is_daemon = False
+
+def main():
+    global debug_mode, is_daemon, current_instance
+    parser = argparse.ArgumentParser(description="SUFE Campus Network 802.1X Authenticator")
+    parser.add_argument("-i", "--ifname", help="Network interface (e.g. eth1)")
+    parser.add_argument("-u", "--username", help="Username (e.g. 2023xxxxxx@cmcc)")
+    parser.add_argument("-p", "--password", help="Password")
+    parser.add_argument("-m", "--mac", help="Override MAC address")
+    parser.add_argument("-s", "--switch-mac", help="Switch MAC address")
+    parser.add_argument("-N", "--network", help="OpenWrt logical interface (e.g. wan, wan2)")
+    parser.add_argument("-n", "--name", help="Instance name / Section identifier")
+    parser.add_argument("-d", "--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debug output")
+
+    args = parser.parse_args()
+    debug_mode = args.verbose
+    is_daemon = args.daemon
+
+    section = args.name or "config"
+    current_instance = args.name or args.ifname or "sufe_auth"
+
+    syslog.openlog(f"sufe_auth_{current_instance}", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+    # Load from UCI if not specified in args
+    ifname = args.ifname or get_uci_option("sufe_auth", section, "ifname", "eth1")
+    username = args.username or get_uci_option("sufe_auth", section, "username")
+    password = args.password or get_uci_option("sufe_auth", section, "password")
+    mac = args.mac or get_uci_option("sufe_auth", section, "mac", "")
+    switch_mac_str = args.switch_mac or get_uci_option("sufe_auth", section, "switch_mac", "58:ae:a8:88:0c:31")
+    network = args.network or get_uci_option("sufe_auth", section, "network", "wan")
+
+    if not username or not password:
+        log("Error: Username and password must be provided via CLI or UCI config!", syslog.LOG_ERR)
+        sys.exit(1)
+
+    switch_mac = bytes.fromhex(switch_mac_str.replace(":", "")) if switch_mac_str else None
+
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+
+    client = SufeAuthClient(
+        ifname=ifname,
+        username=username,
+        password=password,
+        target_mac=mac,
+        switch_mac=switch_mac,
+        network=network,
+        instance_name=current_instance
+    )
+    client.run()
+
+if __name__ == "__main__":
+    main()

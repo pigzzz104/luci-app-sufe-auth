@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs and runtime caches
+*.log
+/tmp/
+
+# Sensitive local backups & private prompt logs
+backup_before_3wan/
+Branch of OpenWrt*
+*.bak
+*.orig
+*.saved
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
