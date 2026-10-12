@@ -1,29 +1,24 @@
 #!/bin/sh
 # ==============================================================================
-# configure_mwan3.sh - 多线聚合与策略路由 (MWAN3) 一键优化配置脚本
-# 基于上财宿舍实战验证方案（支持双线/三线负载均衡、游戏低延迟防跳变、多线程下载翻倍）
+# configure_mwan3.sh - 多线聚合与策略路由 (MWAN3) 配置脚本
+# 架构方案：Linux 内核 FIB Multipath 流哈希 (Table 50) + MWAN3 策略路由协同
 # GitHub: https://github.com/pigzzz104/luci-app-sufe-auth
 # ==============================================================================
 
 set -e
 
-echo "=========================================================="
-echo "  MWAN3 多线聚合与分流策略一键配置脚本                   "
-echo "=========================================================="
-
-# 1. 检查 mwan3 是否安装
+# 1. 检查 mwan3 依赖
 if ! command -v mwan3 >/dev/null 2>&1; then
-    echo "[!] 未检测到 mwan3 命令，准备尝试安装 mwan3 与 luci-app-mwan3..."
+    echo "未检测到 mwan3，正在安装依赖 (mwan3, luci-app-mwan3)..."
     opkg update || true
     opkg install mwan3 luci-app-mwan3 || {
-        echo "[!] 安装 mwan3 失败，请检查网络连接后手动运行: opkg install mwan3 luci-app-mwan3"
+        echo "错误: 安装 mwan3 失败，请检查网络连接。"
         exit 1
     }
 fi
 
-# 2. 检查并设置网络接口跃点 (Metric)
-echo "[1/4] 配置各 WAN 接口路由跃点 (Metric)..."
-# mwan3 要求每个参与多拨的接口必须有独立的 metric
+# 2. 配置接口路由跃点 (Metric)
+echo "配置 WAN 接口路由跃点 (Metric)..."
 [ "$(uci -q get network.wan.metric)" != "10" ] && uci set network.wan.metric='10'
 if uci -q get network.wan2 >/dev/null; then
     [ "$(uci -q get network.wan2.metric)" != "20" ] && uci set network.wan2.metric='20'
@@ -34,8 +29,8 @@ fi
 uci commit network
 /etc/init.d/network reload 2>/dev/null || true
 
-# 3. 检查并确保防火墙 WAN 区域包含各接口
-echo "[2/4] 同步防火墙 WAN 区域关联..."
+# 3. 同步防火墙区域关联
+echo "同步防火墙 WAN 区域关联..."
 for iface in wan2 wan3; do
     if uci -q get network.$iface >/dev/null; then
         uci -q del_list firewall.@zone[1].network="$iface"
@@ -45,8 +40,8 @@ done
 uci commit firewall
 /etc/init.d/firewall reload 2>/dev/null || true
 
-# 4. 备份原 mwan3 配置
-echo "[3/4] 备份并写入优化后的 MWAN3 策略配置..."
+# 4. 备份原 mwan3 配置并写入精简策略
+echo "更新 /etc/config/mwan3 策略配置..."
 if [ -f /etc/config/mwan3 ]; then
     cp -p /etc/config/mwan3 "/etc/config/mwan3.bak.$(date +%Y%m%d_%H%M%S)"
 fi
@@ -104,7 +99,7 @@ config member 'wan2_m1_w1'
 
 config member 'wan3_m1_w1'
 	option interface 'wan3'
-	option metric '1'
+	option metric '3'
 	option weight '1'
 
 config member 'wan2_m2_w1'
@@ -159,8 +154,7 @@ config rule 'https'
 config rule 'quic'
 	option proto 'udp'
 	option dest_port '443'
-	option sticky '1'
-	option timeout '600'
+	option sticky '0'
 	option use_policy 'balanced'
 
 config rule 'default_rule'
@@ -169,15 +163,77 @@ config rule 'default_rule'
 	option use_policy 'balanced'
 EOF
 
-# 5. 重启 mwan3 服务
-echo "[4/4] 启动并启用 MWAN3 服务..."
+# 5. 部署内核 FIB Multipath 动态同步脚本 (/etc/mwan3.user)
+echo "部署 /etc/mwan3.user 同步脚本..."
+cat << 'EOF' > /etc/mwan3.user
+#!/bin/sh
+# Multi-WAN Kernel FIB Multipath Sync Script
+# Manages Table 50 for deterministic (src_ip, dst_ip) flow hashing
+
+sync_mwan3_multipath() {
+    local nexthops=""
+    local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
+    local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
+    local wan3_st=$(cat /var/run/mwan3/iface_state/wan3 2>/dev/null)
+
+    # 动态探测各网卡网关
+    local gw1=$(ip route show dev eth1 2>/dev/null | awk '/default/ {print $3}')
+    [ -z "$gw1" ] && gw1=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+    [ -z "$gw1" ] && gw1="10.64.0.1"
+
+    local gw2=$(ip route show dev eth0.2 2>/dev/null | awk '/default/ {print $3}')
+    [ -z "$gw2" ] && gw2=$(ubus call network.interface.wan2 status 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+    [ -z "$gw2" ] && gw2="$gw1"
+
+    local gw3=$(ip route show dev eth0.3 2>/dev/null | awk '/default/ {print $3}')
+    [ -z "$gw3" ] && gw3=$(ubus call network.interface.wan3 status 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+    [ -z "$gw3" ] && gw3="$gw1"
+
+    [ "$wan1_st" = "online" ] && nexthops="$nexthops nexthop via $gw1 dev eth1 weight 1"
+    [ "$wan2_st" = "online" ] && nexthops="$nexthops nexthop via $gw2 dev eth0.2 weight 1"
+    [ "$wan3_st" = "online" ] && nexthops="$nexthops nexthop via $gw3 dev eth0.3 weight 1"
+
+    if [ -n "$nexthops" ]; then
+        ip route replace default table 50 proto static $nexthops
+    else
+        ip route flush table 50
+    fi
+
+    # 确保 fwmark 0x300 指向 Table 50
+    ip rule list | grep -q 'lookup 50' || ip rule add pref 2003 fwmark 0x300/0x3f00 lookup 50
+
+    # 确保 mwan3_policy_balanced 链委托给内核 FIB Multipath 路由
+    if [ -n "$(iptables -t mangle -S mwan3_policy_balanced 2>/dev/null)" ]; then
+        if ! iptables -t mangle -C mwan3_policy_balanced -j MARK --set-xmark 0x300/0x3f00 2>/dev/null; then
+            iptables -t mangle -F mwan3_policy_balanced
+            iptables -t mangle -A mwan3_policy_balanced -j MARK --set-xmark 0x300/0x3f00
+        fi
+    fi
+}
+
+sync_mwan3_multipath
+EOF
+chmod +x /etc/mwan3.user
+
+# 确保防火墙启动/重载时自动调用 /etc/mwan3.user
+if [ -f /etc/firewall.user ]; then
+    grep -q "/etc/mwan3.user" /etc/firewall.user || echo "/etc/mwan3.user" >> /etc/firewall.user
+else
+    echo "/etc/mwan3.user" > /etc/firewall.user
+fi
+
+# 清理遗留历史组件
+rm -f /usr/sbin/update-mwan-rules.sh 2>/dev/null || true
+if [ -f /etc/crontabs/root ]; then
+    sed -i '/update-mwan-rules/d' /etc/crontabs/root 2>/dev/null || true
+fi
+ipset destroy mwan3_multistream 2>/dev/null || true
+
+# 6. 重启 mwan3 服务并立即同步
+echo "重启 MWAN3 服务..."
 /etc/init.d/mwan3 enable
 /etc/init.d/mwan3 restart
+sleep 1
+/etc/mwan3.user
 
-echo "=========================================================="
-echo "  MWAN3 配置完成！"
-echo "  - 已配置双公共 DNS (阿里/腾讯) 实时链路探测 (心跳 5s)"
-echo "  - 游戏与语音常见端口已配置 IP 粘性固定首选主 WAN 线路"
-echo "  - 通用流量与多线程下载已启用 balanced 多线均衡叠加"
-echo "  - 可执行 'mwan3 status' 查看当前多路链路状态"
-echo "=========================================================="
+echo "配置完成。可通过 'ip route show table 50' 查看路由状态。"
