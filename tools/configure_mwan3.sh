@@ -44,13 +44,30 @@ uci commit firewall
 grep -q "nf_conntrack_tcp_be_liberal" /etc/sysctl.conf 2>/dev/null || echo "net.netfilter.nf_conntrack_tcp_be_liberal=1" >> /etc/sysctl.conf
 sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true
 
-# 4. 收敛 dnsmasq 上游 DNS，关闭并发抢答防止 CDN 解析至跨网/海外节点
+# 固化内核三层流哈希模式，确保同一目标 IP 流量严格锁定同一 WAN 出口，彻底根除 IP 漂移与 WAF 拦截
+grep -q "fib_multipath_hash_policy" /etc/sysctl.conf 2>/dev/null || echo "net.ipv4.fib_multipath_hash_policy=0" >> /etc/sysctl.conf
+sysctl -w net.ipv4.fib_multipath_hash_policy=0 >/dev/null 2>&1 || true
+
+# 阻断 UDP 443 (QUIC)，防止 HTTP/3 握手受阻触发 3 秒降级等待，强制 0ms 瞬间回退至稳定 HTTP/2 TCP
+if ! uci show firewall | grep -q "Reject-QUIC-UDP443"; then
+    uci add firewall rule
+    uci set firewall.@rule[-1].name="Reject-QUIC-UDP443"
+    uci set firewall.@rule[-1].src="lan"
+    uci set firewall.@rule[-1].dest="wan"
+    uci set firewall.@rule[-1].proto="udp"
+    uci set firewall.@rule[-1].dest_port="443"
+    uci set firewall.@rule[-1].target="REJECT"
+    uci commit firewall
+    /etc/init.d/firewall reload 2>/dev/null || true
+fi
+
+# 4. 优化 dnsmasq 上游 DNS 配置 (支持网盘多集群节点并发散列，屏蔽 IPv6 延迟)
 echo "优化 dnsmasq 上游 DNS 配置..."
 uci -q delete dhcp.@dnsmasq[0].server
-uci add_list dhcp.@dnsmasq[0].server="211.136.150.66"
-uci add_list dhcp.@dnsmasq[0].server="211.136.112.50"
 uci add_list dhcp.@dnsmasq[0].server="223.5.5.5"
-uci -q delete dhcp.@dnsmasq[0].allservers
+uci add_list dhcp.@dnsmasq[0].server="119.29.29.29"
+uci set dhcp.@dnsmasq[0].allservers='1'
+uci set dhcp.@dnsmasq[0].filter_aaaa='1'
 uci commit dhcp
 /etc/init.d/dnsmasq reload 2>/dev/null || true
 
@@ -165,12 +182,6 @@ config rule 'https'
 	option sticky '0'
 	option use_policy 'balanced'
 
-config rule 'quic'
-	option proto 'udp'
-	option dest_port '443'
-	option sticky '0'
-	option use_policy 'balanced'
-
 config rule 'default_rule'
 	option dest_ip '0.0.0.0/0'
 	option sticky '0'
@@ -185,6 +196,7 @@ cat << 'EOF' > /etc/mwan3.user
 # Manages Table 50 for deterministic (src_ip, dst_ip) flow hashing
 
 sync_mwan3_multipath() {
+    sysctl -w net.ipv4.fib_multipath_hash_policy=0 >/dev/null 2>&1
     local nexthops=""
     local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
     local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
