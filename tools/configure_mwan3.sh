@@ -29,8 +29,8 @@ fi
 uci commit network
 /etc/init.d/network reload 2>/dev/null || true
 
-# 3. 同步防火墙区域关联
-echo "同步防火墙 WAN 区域关联..."
+# 3. 同步防火墙区域关联与硬件加速兼容参数
+echo "同步防火墙 WAN 区域与内核连接跟踪参数..."
 for iface in wan2 wan3; do
     if uci -q get network.$iface >/dev/null; then
         uci -q del_list firewall.@zone[1].network="$iface"
@@ -40,7 +40,21 @@ done
 uci commit firewall
 /etc/init.d/firewall reload 2>/dev/null || true
 
-# 4. 备份原 mwan3 配置并写入精简策略
+# 开启 nf_conntrack 宽松窗口模式，使 mtkhnat 硬件加速与多 WAN 并行时不因序列号超前误丢 HTTP/2 长连接包
+grep -q "nf_conntrack_tcp_be_liberal" /etc/sysctl.conf 2>/dev/null || echo "net.netfilter.nf_conntrack_tcp_be_liberal=1" >> /etc/sysctl.conf
+sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true
+
+# 4. 收敛 dnsmasq 上游 DNS，关闭并发抢答防止 CDN 解析至跨网/海外节点
+echo "优化 dnsmasq 上游 DNS 配置..."
+uci -q delete dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server="211.136.150.66"
+uci add_list dhcp.@dnsmasq[0].server="211.136.112.50"
+uci add_list dhcp.@dnsmasq[0].server="223.5.5.5"
+uci -q delete dhcp.@dnsmasq[0].allservers
+uci commit dhcp
+/etc/init.d/dnsmasq reload 2>/dev/null || true
+
+# 5. 备份原 mwan3 配置并写入精简策略
 echo "更新 /etc/config/mwan3 策略配置..."
 if [ -f /etc/config/mwan3 ]; then
     cp -p /etc/config/mwan3 "/etc/config/mwan3.bak.$(date +%Y%m%d_%H%M%S)"
@@ -163,7 +177,7 @@ config rule 'default_rule'
 	option use_policy 'balanced'
 EOF
 
-# 5. 部署内核 FIB Multipath 动态同步脚本 (/etc/mwan3.user)
+# 6. 部署内核 FIB Multipath 动态同步脚本 (/etc/mwan3.user)
 echo "部署 /etc/mwan3.user 同步脚本..."
 cat << 'EOF' > /etc/mwan3.user
 #!/bin/sh
@@ -229,7 +243,7 @@ if [ -f /etc/crontabs/root ]; then
 fi
 ipset destroy mwan3_multistream 2>/dev/null || true
 
-# 6. 重启 mwan3 服务并立即同步
+# 7. 重启 mwan3 服务并立即同步
 echo "重启 MWAN3 服务..."
 /etc/init.d/mwan3 enable
 /etc/init.d/mwan3 restart
