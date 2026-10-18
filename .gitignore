@@ -26,3 +26,8 @@ Branch of OpenWrt*
 .idea/
 *.swp
 *.swo
+
+# AI History Migration Exports
+ai_migration_export/
+*.tar.gz
+*.zip

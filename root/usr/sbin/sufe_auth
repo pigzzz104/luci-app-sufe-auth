@@ -44,6 +44,11 @@ debug_mode = False
 
 current_instance = "default"
 
+# If the gateway itself is unreachable (stale campus switch VLAN/session),
+# bounce the WAN link once to re-trigger 802.1X. Keep a cooldown so a real
+# upstream outage does not flap the port every minute.
+LINK_BOUNCE_COOLDOWN = 300
+
 def log(msg, level=syslog.LOG_INFO):
     prefix = f"[sufe_auth:{current_instance}] "
     if debug_mode or not is_daemon:
@@ -111,6 +116,7 @@ class SufeAuthClient:
         self.my_mac = None
         self.is_authenticated = False
         self.last_auth_time = 0
+        self.last_link_bounce = 0
 
     def init_socket(self):
         if self.sock:
@@ -162,17 +168,64 @@ class SufeAuthClient:
     def trigger_dhcp(self):
         log(f"Authentication successful! Triggering DHCP on interface '{self.network}'...")
         try:
-            # Check if interface already has an assigned IPv4 address
-            has_ip = subprocess.run(f"ip -4 addr show dev {self.ifname} 2>/dev/null | grep -q 'inet '", shell=True).returncode == 0
-            if has_ip:
-                # If we already hold a lease, renew smoothly without resetting device
-                subprocess.run(["ubus", "call", f"network.interface.{self.network}", "renew"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                # If no IP lease yet, bring interface up to force DHCP discover broadcast
-                subprocess.run(["ifup", self.network], check=False)
+            # Never call ifup here: netifd re-applies network.<iface>.macaddr,
+            # which bounces the link and destroys the just-established 802.1X
+            # session, causing an endless auth -> DHCP -> link-reset loop.
+            # ubus renew only asks netifd's udhcpc to renew/discover.
+            subprocess.run(["ubus", "call", f"network.interface.{self.network}", "renew"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             log(f"Failed to trigger DHCP on {self.network}: {e}", syslog.LOG_WARNING)
+
+    def get_gateway(self):
+        try:
+            out = subprocess.check_output(
+                ["ip", "route", "show", "default", "dev", self.ifname],
+                stderr=subprocess.DEVNULL
+            ).decode("utf-8", "ignore")
+            for line in out.splitlines():
+                parts = line.split()
+                if "via" in parts:
+                    return parts[parts.index("via") + 1]
+        except Exception:
+            pass
+        return None
+
+    def gateway_reachable(self):
+        gw = self.get_gateway()
+        if not gw:
+            return None
+        res = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", "-I", self.ifname, gw],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return res.returncode == 0
+
+    def recover_wan(self):
+        # A campus switch can keep the port in an unauthorized/guest VLAN
+        # after an EAPOL-Logoff or a DHCP NAK. A plain carrier bounce is not
+        # enough; the switch needs a complete Logoff -> wait -> Start cycle.
+        log(f"Forcing EAPOL-Logoff and full re-authentication on {self.ifname}...",
+            syslog.LOG_WARNING)
+        try:
+            self.send_logoff()
+        except Exception:
+            pass
+        time.sleep(10)
+        if "." not in self.ifname:
+            log(f"Bouncing physical link {self.ifname}...", syslog.LOG_WARNING)
+            subprocess.run(["ip", "link", "set", self.ifname, "down"], check=False)
+            time.sleep(2)
+            subprocess.run(["ip", "link", "set", self.ifname, "up"], check=False)
+            time.sleep(3)
+        else:
+            log(f"VLAN interface {self.ifname}: skipping link bounce, EAPOL re-auth only.",
+                syslog.LOG_WARNING)
+        try:
+            self.init_socket()
+        except Exception as e:
+            log(f"Re-init socket before re-auth failed: {e}", syslog.LOG_WARNING)
+        self.authenticate_loop()
 
     def authenticate_loop(self):
         max_attempts = 5
@@ -257,6 +310,7 @@ class SufeAuthClient:
         log("Entering monitoring & keepalive loop...")
         last_carrier_check = time.time()
         last_ping_check = time.time()
+        last_no_ip_check = 0
         last_keepalive_log = 0
         fail_count = 0
 
@@ -312,7 +366,29 @@ class SufeAuthClient:
                         self.authenticate_loop()
                         continue
 
-            # 3. Check connectivity every 60 seconds
+            # 3. If authenticated but still has no IPv4 after 30s, the switch
+            #    may have kept the port in a guest/unauthorized VLAN (often
+            #    after EAPOL-Logoff or a DHCP NAK). Recover with a full
+            #    Logoff -> wait -> Start cycle, not just an ifup/carrier bounce.
+            if self.is_authenticated and (now - last_no_ip_check >= 10):
+                last_no_ip_check = now
+                has_ip_now = subprocess.run(
+                    f"ip -4 addr show dev {self.ifname} | grep -q 'inet '",
+                    shell=True
+                ).returncode == 0
+                if (not has_ip_now and self.last_auth_time
+                        and (now - self.last_auth_time >= 30)):
+                    if now - self.last_link_bounce >= LINK_BOUNCE_COOLDOWN:
+                        self.last_link_bounce = now
+                        log(f"No IPv4 lease on {self.ifname} after authentication; "
+                            "forcing EAPOL-Logoff and re-authentication...", syslog.LOG_WARNING)
+                        self.recover_wan()
+                        continue
+                    else:
+                        log(f"No IPv4 lease on {self.ifname}, but recovery cooldown is active.",
+                            syslog.LOG_WARNING)
+
+            # 4. Check connectivity every 60 seconds
             if self.is_authenticated and (now - last_ping_check >= 60):
                 last_ping_check = now
                 # Check if interface has an IPv4 address before pinging
@@ -332,8 +408,29 @@ class SufeAuthClient:
                         if fail_count >= 3:
                             log("Connectivity lost! Triggering re-authentication...", syslog.LOG_ERR)
                             fail_count = 0
-                            self.init_socket()
-                            self.authenticate_loop()
+                            gw_ok = self.gateway_reachable()
+                            if gw_ok is False:
+                                now_b = time.time()
+                                if now_b - self.last_link_bounce >= LINK_BOUNCE_COOLDOWN:
+                                    self.last_link_bounce = now_b
+                                    log("Gateway unreachable! Forcing EAPOL-Logoff and "
+                                        "full re-authentication...", syslog.LOG_ERR)
+                                    self.recover_wan()
+                                else:
+                                    log("Gateway unreachable, but recovery cooldown is active; "
+                                        "re-authenticating without logoff.", syslog.LOG_WARNING)
+                                    self.init_socket()
+                                    self.authenticate_loop()
+                            elif gw_ok is None:
+                                log(f"No default gateway found on {self.ifname}; "
+                                    "re-authenticating without link bounce.", syslog.LOG_WARNING)
+                                self.init_socket()
+                                self.authenticate_loop()
+                            else:
+                                # Gateway is fine; the upstream/server path is down.
+                                # Do not logoff/bounce the campus port for this.
+                                self.init_socket()
+                                self.authenticate_loop()
 
     def run(self):
         while running:

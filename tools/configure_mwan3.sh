@@ -262,4 +262,16 @@ echo "重启 MWAN3 服务..."
 sleep 1
 /etc/mwan3.user
 
+# 8. 关闭 MTK HNAT/WARP 硬件加速
+# HNAT 会绕过 netfilter/mwan3 缓存 NAPT；双 WAN 同网段时可能在 TCP 20KB
+# 处卡死，表现为部分图片/网页永远空白、部分过段时间又能加载。
+# 详见 tools/fix_hnat_offload.sh 与 README 的“多 WAN 稳定性”章节。
+FIX_HNAT="$(dirname "$0")/fix_hnat_offload.sh"
+if [ -x "$FIX_HNAT" ]; then
+    echo "关闭 MTK HNAT 硬件加速..."
+    "$FIX_HNAT" install || echo "警告: 关闭 HNAT 失败，请手动运行 $FIX_HNAT install"
+else
+    echo "提示: 未找到 $FIX_HNAT；若为 MTK 平台，请手动关闭 HNAT，否则可能出现图片/网页卡死。"
+fi
+
 echo "配置完成。可通过 'ip route show table 50' 查看路由状态。"

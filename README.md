@@ -12,6 +12,56 @@
 
 ---
 
+### ⚠️ 多 WAN 稳定性必读：关闭 MTK HNAT 硬件加速
+
+在 MT7981/MT798x 等联发科平台上，**HNAT/WARP 硬件加速会绕过 netfilter/mwan3 直接缓存 NAPT 流**。当多条 WAN 处于同一子网（例如校园网 `10.64.0.0/21`）并使用 FIB Multipath + mwan3 时，HNAT 可能把流固定到错误的 WAN，或在 **TCP 20KB 窗口处卡死**。
+
+典型症状（与设备无关，局域网多台设备均可复现）：
+
+- 部分网页/图片一直空白，刷新多次也不出来；
+- 部分图片/网页等待一段时间后又能加载；
+- 路由器本机 `curl` 正常，但 WiFi 客户端容易复现；
+- 客户端（curl）可见传输停在 `20480 / ~47xxx` 字节（20KB）不再前进。
+
+**一键修复（路由器上执行）：**
+
+```bash
+sh tools/fix_hnat_offload.sh install
+```
+
+脚本会：关闭 TurboACC 自启及其硬件 offload，安装**开机一次性关闭脚本**（`S99hnat-off`，无常驻进程）和**网口 ifup 事件钩子**（WAN/WiFi 重新拉起时再写 0），保留 BBR。
+
+> 默认是“零常驻”精简模式。如果你希望即使手动重开 TurboACC 也能在 10 秒内自动再关掉，可额外执行：
+> `sh tools/fix_hnat_offload.sh install-watchdog`（会常驻约 1 MB 内存、0% CPU，每 10 秒检查一次）。
+
+**验证：**
+
+```bash
+# 应为 0
+grep -c NAPT /sys/kernel/debug/hnat/hnat_entry
+
+# 应显示 one-shot mode、enabled、ifup hook installed
+sh tools/fix_hnat_offload.sh status
+
+# 确认没有常驻进程（精简模式）
+ps w | grep '[h]nat-off' || echo "no daemon"
+
+# 双线聚合不受影响（实测约 20.9 MiB/s）
+```
+
+详细诊断过程、A/B 对照数据与聚合测试见 [docs/HNAT_MULTIWAN_DIAGNOSIS.md](docs/HNAT_MULTIWAN_DIAGNOSIS.md)。
+
+**回滚：**
+
+```bash
+sh tools/fix_hnat_offload.sh rollback
+# 或路由器本地：/root/rollback_hnat_off.sh
+```
+
+> 关闭 HNAT 只影响硬件 NAT 卸载，不影响路由、NAT、mwan3 或双线聚合；MT7981 的 CPU 足以处理 2×100Mbps。若你的设备没有 `/sys/kernel/debug/hnat/hook_toggle`，脚本会自动跳过。
+
+---
+
 ## 功能特性
 
 - **纯原生实现**：基于 Python 3 原生 Socket 封装 IEEE 802.1X EAPOL 协议栈，无第三方扩展库依赖，运行内存占用小（单实例约 10MB）。
@@ -57,6 +107,7 @@ luci-app-sufe-auth/
 │           └── sufe_auth                  # 802.1X 认证核心程序
 ├── tools/
 │   ├── configure_mwan3.sh                 # 实用工具：MWAN3 策略路由一键优化配置脚本
+│   ├── fix_hnat_offload.sh                # 实用工具：关闭 MTK HNAT，修复多 WAN 图片/网页卡死
 │   └── restore_ipv6.sh                    # 实用工具：一键还原 IPv6 配置
 ├── install.sh                             # 路由器一键安装脚本
 ├── uninstall.sh                           # 卸载脚本
@@ -167,6 +218,39 @@ make package/luci-app-sufe-auth/compile V=s
   ```bash
   python3 /usr/sbin/sufe_auth -i eth1 -u 账号@cmcc -p 密码 -v
   ```
+
+### 重启后认证成功但 DHCP 拿不到地址
+
+如果日志出现：
+
+```text
+EAP Authentication SUCCESS!
+Authentication successful! Triggering DHCP...
+netifd: Interface 'wan' is disabled
+netifd: wan: Command failed: Permission denied
+```
+
+这不是账号失败，而是 **`trigger_dhcp()` 调用了 `ifup <network>`**。netifd 会重新套用 `network.<iface>.macaddr`，把刚认证成功的 WAN 链路 down/up，802.1X 会话随之失效，形成“认证成功 → DHCP 失败 → 重认证”的循环。
+
+修复：`trigger_dhcp()` 只调用不重置链路的：
+
+```bash
+ubus call network.interface.wan renew
+```
+
+`root/usr/sbin/sufe_auth` 已修正，并加入自动恢复：
+
+- 认证成功后 **30 秒仍无 IPv4**，或连续 3 次 **网关不可达**，自动执行
+  `EAPOL-Logoff → 等待 10 秒 → 重新 Start`；
+- 物理口（eth1）额外做一次 link bounce，VLAN 口（eth0.2）只做 EAPOL 重认证，
+  不会把 LAN 一起断掉；
+- 5 分钟冷却，避免上游真故障时反复踢端口。
+
+如果自动恢复因冷却/异常没有生效，再手动执行：
+
+```bash
+ip link set eth1 down; sleep 3; ip link set eth1 up
+```
 
 ---
 
