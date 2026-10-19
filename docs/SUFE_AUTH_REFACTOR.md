@@ -384,3 +384,17 @@ len(password) + password + username
 当前剩余的数据面问题（EAP/DHCP 正常、`10.64.0.1` ARP 不通）仍按第 9 节
 处理：优先用另一台设备直插同一墙面端口对比，并联系管理员检查端口
 802.1X 授权 VLAN、MAC 绑定、port-security sticky MAC 和 DHCP snooping。
+
+### 9.1 后续 A/B 对照（2026-10-19 13:56）
+
+在用户确认 WAN1 绑定 MAC 就是 `00:78:32:26:60:5e` 后，继续做了四组对照：
+
+1. 关闭 `startup_logoff`，重启 + 15 秒 link reset：网关仍不可达；
+2. EAP-Success 后手动 `ifup wan`（旧版无 IP 时的动作）：仍不可达；
+3. 恢复旧版“单播+组播双 Start”：eth1 反而拿不到 DHCP，更差；
+4. 停止认证 90 秒让交换机会话老化，再干净启动：eth1/eth0.2 都拿到新 IP，
+   EAP 正常，但 `10.64.0.1` 仍然 ARP 不通。
+
+因此可以排除“少发某个 EAPOL 报文”“少一次 ifup”“少一次 Logoff”这些
+认证侧原因。当前失败点在交换机端口数据面/上游网关，而不是 `sufe_auth`。
+MAC 本身是正确的，不需要改成别的值。
