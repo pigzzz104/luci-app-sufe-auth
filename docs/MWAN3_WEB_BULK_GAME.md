@@ -314,3 +314,25 @@ WAN2 物理链路正常，但 LAN→WAN2 的 forwarded/NAT 大 TLS 会卡。当�
 /root/nat.pre_wan2fix.*
 /root/table2.pre_wan2fix.*
 ```
+
+---
+
+## 12. 下载不聚合的根因：mwan3_connected 覆盖回程 mark
+
+夸克下载在 `.198` 上建立 172 条到同一 CDN IP 的连接，但 conntrack 最终
+mark 全是 `0x3f00`，不是 bulk 的 `0x300`，所以只走主路由表单条 WAN。
+
+根因在 `/etc/mwan3.user`/mwan3 生成的 `mwan3_hook` 最后一条：
+
+```text
+-A mwan3_hook -m mark ! --mark 0x3f00/0x3f00 -j mwan3_connected
+```
+
+`mwan3_connected_v4` 包含 `192.168.6.0/24`。WAN 回程到 LAN 的包命中该规则，
+被标成 `0x3f00`，随后 `CONNMARK --save-mark` 覆盖了原来的 web/bulk mark。
+之后所有包都从主表走，Table 50 聚合失效。
+
+修复：删除这条最终规则，保留前面的 `mwan3_connected`（新建连接仍能识别直连）。
+持久化函数 `sync_mwan3_connected_fix()` 会在 ifup/hotplug 后重新删除它。
+
+旧连接仍带 `0x3f00`；需要取消/重新建立下载任务，让新连接重新分类。

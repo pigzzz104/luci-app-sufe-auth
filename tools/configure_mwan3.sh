@@ -299,6 +299,15 @@ sync_wan2_nat_path() {
         iptables -t nat -I POSTROUTING 1 -j MWAN3_WAN2_SNAT
 }
 
+sync_mwan3_connected_fix() {
+    # mwan3_connected contains 192.168.6.0/24. The final mwan3_hook rule
+    # re-marks WAN->LAN reply packets as 0x3f00 and saves that into conntrack,
+    # overwriting the web/bulk class mark. Remove that final rule; new
+    # connections are still handled by the earlier mwan3_connected jump.
+    iptables -t mangle -D mwan3_hook \
+        -m mark ! --mark 0x3f00/0x3f00 -j mwan3_connected 2>/dev/null
+}
+
 sync_traffic_classification() {
     command -v ipset >/dev/null 2>&1 || return 0
 
@@ -345,6 +354,7 @@ sync_traffic_classification() {
 
 sync_mwan3_multipath
 sync_wan2_nat_path
+sync_mwan3_connected_fix
 sync_web_affinity_policy
 sync_traffic_classification
 EOF
