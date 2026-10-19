@@ -82,6 +82,12 @@ local function render_status(state_code, extra_info)
             badge = "● 正在运行",
             desc = "已完成认证"
         },
+        running_degraded = {
+            color = "#faad14",
+            border = "#faad14",
+            badge = "● 认证成功",
+            desc = "认证成功，但网关不可达"
+        },
         running_connecting = {
             color = "#1890ff",
             border = "#1890ff",
@@ -147,12 +153,39 @@ local function get_instance_status(section_name, ifname, username, password, ena
 
     if is_running then
         local ip = ""
+        local gateway_failures = 0
+        local auth_state = nil
         if ifname and #ifname > 0 then
             ip = sys.exec(string.format("ip -4 addr show %s 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2", ifname)):gsub("\n", "")
+
+            local status_file = "/var/run/sufe_auth." .. ifname .. ".json"
+            local handle = io.open(status_file, "r")
+            if handle then
+                local raw = handle:read("*a")
+                handle:close()
+                local ok, status = pcall(function()
+                    return require("luci.jsonc").parse(raw)
+                end)
+                if ok and status then
+                    gateway_failures = tonumber(status.gateway_failures) or 0
+                    auth_state = status.state
+                end
+            end
         end
         if ip and #ip > 0 then
-            local detail = "已完成认证 &nbsp;|&nbsp; 内网 IP: <span style='font-weight:bold; color:#1890ff;'>" .. ip .. "</span>"
-            return render_status("running_online", detail)
+            if auth_state and auth_state ~= "online" then
+                return render_status("running_connecting")
+            end
+            local detail
+            if gateway_failures > 0 then
+                detail = string.format(
+                    "认证成功，但网关不可达 (%d/3) &nbsp;|&nbsp; 内网 IP: <span style='font-weight:bold; color:#1890ff;'>%s</span>",
+                    gateway_failures, ip)
+                return render_status("running_degraded", detail)
+            else
+                detail = "已完成认证 &nbsp;|&nbsp; 内网 IP: <span style='font-weight:bold; color:#1890ff;'>" .. ip .. "</span>"
+                return render_status("running_online", detail)
+            end
         else
             return render_status("running_connecting")
         end

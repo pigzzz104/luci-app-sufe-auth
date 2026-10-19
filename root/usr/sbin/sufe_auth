@@ -544,6 +544,7 @@ class SufeAuthClient:
             "since": wall_time() - (now - self.state_since),
             "last_success": self.last_success or None,
             "last_error": self.last_error or None,
+            "gateway_failures": self.gateway_failures,
             "recovery_count": self.recovery_count,
             "recovery_reason": self.recovery_reason or None,
             "ipv4": ipv4_address(self.cfg.ifname),
@@ -692,7 +693,6 @@ class SufeAuthClient:
     def on_success(self, frame: Frame) -> None:
         self.last_success = wall_time()
         self.last_error = ""
-        self.gateway_failures = 0
         if self.state in (STATE_AUTH, STATE_RECOVER):
             self.auth_attempts = 0
             self.set_state(STATE_WAIT_DHCP, "EAP-Success")
@@ -910,7 +910,9 @@ class SufeAuthClient:
         if address:
             self.set_state(STATE_ONLINE, f"DHCP lease {address}")
             self.online_since = now
-            self.next_gateway_check = now + 60.0
+            # Check soon so an EAP-Failure/re-auth cycle cannot indefinitely
+            # postpone the first data-plane health check.
+            self.next_gateway_check = now + 15.0
             self.next_ip_check = now + 5.0
             self.gateway_failures = 0
             self.recovery_count = 0
@@ -948,7 +950,9 @@ class SufeAuthClient:
             gateway = default_gateway(self.cfg.network, self.cfg.ifname)
             if address and gateway:
                 if gateway_reachable(gateway, address):
-                    self.gateway_failures = 0
+                    if self.gateway_failures:
+                        self.gateway_failures = 0
+                        self.write_state()
                 else:
                     self.gateway_failures += 1
                     log(
@@ -956,6 +960,7 @@ class SufeAuthClient:
                         f"({self.gateway_failures}/3)",
                         syslog.LOG_WARNING,
                     )
+                    self.write_state()
                     if self.gateway_failures >= 3:
                         self.gateway_failures = 0
                         self.start_recovery(

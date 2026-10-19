@@ -215,6 +215,15 @@ class TestStateHelpers(unittest.TestCase):
         self.assertEqual(client.dhcp_deadline, 12345.0)
         self.assertEqual(client.state, sufe.STATE_WAIT_DHCP)
 
+    def test_refresh_does_not_clear_gateway_failures(self):
+        client = sufe.SufeAuthClient(self._cfg())
+        client.state = sufe.STATE_ONLINE
+        client.gateway_failures = 2
+        client.on_success(sufe.Frame(src=b"", dst=b"", eapol_type=0,
+                                     eap_code=sufe.EAP_SUCCESS, eap_id=2))
+        self.assertEqual(client.gateway_failures, 2)
+        self.assertEqual(client.state, sufe.STATE_ONLINE)
+
 
 
 class TestRecoverySequence(unittest.TestCase):
