@@ -178,6 +178,7 @@ config rule 'game_high_udp'
 
 config policy 'web_affinity'
 	list use_member 'wan_m1_w1'
+	list use_member 'wan2_m1_w1'
 
 config rule 'web_sticky'
 	option src_ip '192.168.6.0/24'

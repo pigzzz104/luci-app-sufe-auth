@@ -50,17 +50,25 @@ sync_mwan3_multipath() {
 }
 
 sync_web_affinity_policy() {
-    # mwan3 generates this chain from the policy at boot.  WAN2 currently has a
-    # large-TCP defect when traffic carries mark 0x200 (table 2 works without
-    # the mark, but bulk HTTP via mark 0x200 stalls).  Pin web traffic to WAN1
-    # while it is online; only fall back to WAN2 if WAN1 is down.
+    # mwan3 generates this chain from the policy at boot.  When WAN2 was not
+    # online yet it may contain only WAN1, so rebuild it here after both links
+    # are up.  New clients are split 50/50; mwan3's sticky set then keeps each
+    # source IP on the selected WAN.
     iptables -t mangle -N mwan3_policy_web_affinity 2>/dev/null
     iptables -t mangle -F mwan3_policy_web_affinity 2>/dev/null
 
     local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
     local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
 
-    if [ "$wan1_st" = "online" ]; then
+    if [ "$wan1_st" = "online" ] && [ "$wan2_st" = "online" ]; then
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -m statistic --mode random --probability 0.5 \
+            -j MARK --set-xmark 0x200/0x3f00
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -j MARK --set-xmark 0x100/0x3f00
+    elif [ "$wan1_st" = "online" ]; then
         iptables -t mangle -A mwan3_policy_web_affinity \
             -m mark --mark 0x0/0x3f00 \
             -j MARK --set-xmark 0x100/0x3f00

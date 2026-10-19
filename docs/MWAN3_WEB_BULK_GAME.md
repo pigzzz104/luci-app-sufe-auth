@@ -46,13 +46,13 @@ config rule 'web_sticky'
 
 规则必须放在 `https` 和 `default_rule` 之前。
 
-**当前固定 WAN1**：WAN2 在 `mark 0x200` 下的大 TCP 存在缺陷（同一 104KB 图片：
-table 2 不带 mark 可成功，mark 0x200 会卡在 0 字节；WAN1 正常）。因此网页统一
-走 WAN1，避免浏览器/缩略图再次卡死。WAN2 仍参与 Table 50 下载聚合和非 80/443
-流量；只有 WAN1 离线时才回退 WAN2。
+网页客户端按 50/50 分散到两条 WAN；`mwan3_sticky_v4_web_sticky` 以
+`(源 IP, mark)` 记住每个客户端的选择，保证同一客户端后续 80/443 连接不再跳
+WAN。
 
-`mwan3_sticky_v4_web_sticky` 以 `(源 IP, mark)` 记住每个客户端的选择，保证同一
-客户端后续 80/443 连接不再跳 WAN。
+注意：**不要用路由器本机源 `.1/.250` 的 mark 测试来判断 WAN2**。Linux 本机
+OUTPUT 流量在 mangle 打 mark 后不一定会重新选路，会制造“WAN2 大包卡死”的
+假象；真实 LAN 转发路径（PREROUTING/FORWARD）没有这个问题。
 
 ---
 
@@ -245,30 +245,32 @@ www.wegame.com.cn -> 117.144.242.171 / 117.135.175.100
 
 ## 10. Mac 关闭 Wi‑Fi 后经 LAN 无法上网（2026-10-19）
 
-现象：Mac 的 `en8` 已接路由器 LAN，但关闭 Wi‑Fi 后无法上网。
+结论：**路由器 LAN/WAN2 没有故障，Mac 侧最终确认 LAN 正常。**
 
-根因不是路由器 LAN/NAT 全局故障，而是：
-
-- Mac `192.168.6.198` 被 web sticky 分到了 **WAN2**；
-- WAN2 在 **mark 0x200** 下的大 TCP 会卡住：
-  - 同一张 104KB 图片，WAN1 返回 104749 字节；
-  - WAN2 + mark 0x200 返回 HTTP 200 头后 0 字节超时；
-  - 同一 WAN2 改用干净 table（不带 mark 0x200）可完整返回 104749 字节；
-  - 因此不是 WAN2 物理链路，而是 mwan3 的 WAN2 marked path。
-- 把 `.198` 固定到 WAN1 后，自动关闭 Wi‑Fi 的实测：
+真实测试：
 
 ```text
-默认路由: 192.168.6.1 dev en8
+Mac en8: 192.168.6.198
+web sticky: 192.168.6.198 -> 0x200 (WAN2)
+关闭 Wi-Fi 后默认路由: 192.168.6.1 dev en8
 ping 192.168.6.1: 0% loss
 ping 223.5.5.5:   0% loss
-nslookup 192.168.6.1: 正常
+nslookup（路由器 192.168.6.1）: 正常
 curl http://www.baidu.com/: HTTP 200
 ```
 
-修复：
+排查过程中曾出现“WAN2 + mark 0x200 的 104KB 图片卡在 0 字节”的结论，那是
+**路由器本机源 `.1/.250` 的 OUTPUT 测试伪影**：本机流量在 OUTPUT 打 mark 后
+没有重新选路，不是真实 LAN 转发。真实 `.198 -> WAN2` 的转发路径实测 200。
 
-- web policy 改为 **WAN1-only**；
-- WAN2 保留给 Table 50 下载/聚合和非 80/443 流量；
-- 只有 WAN1 离线时才回退 WAN2。
+因此：
 
-这也意味着所有网页客户端共用 WAN1；优先保证页面/缩略图稳定，不再让客户端随机落到有 marked-TCP 缺陷的 WAN2。
+- web 策略保持 50/50，`.198` 可以正常粘在 WAN2；
+- `.186/.229` 粘在 WAN1；
+- 如果 Mac 关 Wi-Fi 后仍无法上网，优先检查 Clash TUN 是否真正关闭、默认路由
+  是否变成 `192.168.6.1/en8`、DNS 是否可用，而不是 WAN2。
+
+```bash
+route -n get default
+# 应为 gateway 192.168.6.1, interface en8
+```
