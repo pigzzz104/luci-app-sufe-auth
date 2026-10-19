@@ -398,3 +398,28 @@ len(password) + password + username
 因此可以排除“少发某个 EAPOL 报文”“少一次 ifup”“少一次 Logoff”这些
 认证侧原因。当前失败点在交换机端口数据面/上游网关，而不是 `sufe_auth`。
 MAC 本身是正确的，不需要改成别的值。
+
+---
+
+## 11. 2026-10-19 19:12 现场恢复：物理拔插 60 秒
+
+用户对 WAN 网线做了一次物理拔插 60 秒后，交换机端口状态被清除，网络立即恢复：
+
+```text
+eth1   10.64.4.95/21    gateway 10.64.0.1 0% loss, curl baidu 200
+eth0.2 10.64.7.223/21   gateway 10.64.0.1 0% loss, curl baidu 200
+Table 50: nexthop eth1 + eth0.2
+```
+
+这进一步确认：
+
+- `sufe_auth` 的 EAP/DHCP 没有问题；
+- 之前 `ip link set down/up` 无法清除 H3C 端口的 port-security/err-disable 状态，
+  物理拔插（或管理员 `shutdown/no shutdown`）才可以；
+- 旧版在端口被卡住时同样失败，不是重构代码引入的故障。
+
+恢复后 `mwan3` 的 WAN2 tracker 状态文件仍停留在 `offline`（物理拔插后
+mwan3 没有收到 ifup 事件），手动把 `iface_state/wan2` 置为 `online` 并执行
+`/etc/mwan3.user` 后，Table 50 恢复双线，两条线分别 `curl` 均返回 200。
+若以后再次出现“单线能上网但 Table 50 只有一条”，优先检查
+`/var/run/mwan3/iface_state/wan2` 和 `mwan3track`，而不是先怀疑 802.1X。

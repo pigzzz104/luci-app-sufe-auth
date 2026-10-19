@@ -275,7 +275,7 @@ ip link set eth1 down; sleep 15; ip link set eth1 up
 VLAN 口（eth0.2/eth0.3）不要 down 父接口 `eth0`，否则会影响 LAN/WiFi；优先
 `/etc/init.d/sufe_auth restart`，或拔插对应网线。
 
-> **如果 EAP/DHCP 都成功，但 `ping 10.64.0.1` 仍 100% 丢包、ARP 显示 FAILED**：这是有线校园网网关/端口 ACL/portal 的问题，不是认证脚本能解决的。用另一台设备直插同一墙面端口对比，并联系校园网管理员检查该端口的 802.1X 授权 VLAN、端口安全 sticky MAC 和 DHCP snooping 绑定。详见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md) 第 9 节。
+> **如果 EAP/DHCP 都成功，但 `ping 10.64.0.1` 仍 100% 丢包、ARP 显示 FAILED**：先对 WAN 网线做一次**物理拔插 60 秒**（`ip link set down/up` 往往清不掉 H3C 的 port-security/err-disable）。恢复后若 Table 50 只有一条线，检查 `mwan3track`/`iface_state`。这属于有线校园网端口/网关问题，不是认证脚本能单独解决的。用另一台设备直插同一墙面端口对比，并联系校园网管理员检查该端口的 802.1X 授权 VLAN、端口安全 sticky MAC 和 DHCP snooping 绑定。详见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md) 第 9 节。
 
 ---
 
