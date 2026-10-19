@@ -81,7 +81,7 @@ sh tools/fix_hnat_offload.sh rollback
 
 > **2.0 重构详情**：见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md)。其中记录了 H3C S3110 的 30 秒数据 VLAN 延迟、重复 EAPOL-Start 导致双会话、旧版 30 秒 Logoff 循环的完整抓包证据与验证数据。
 
-- **三类多 WAN 流量**：网页 TCP 80/443 每客户端 sticky 单 WAN；高并发下载回 Table 50 聚合；游戏 UDP 固定 WAN1，游戏期间新下载切 WAN2。详见 [docs/MWAN3_WEB_BULK_GAME.md](docs/MWAN3_WEB_BULK_GAME.md)。
+- **三类多 WAN 流量**：网页 TCP 80/443 每客户端 sticky 固定 WAN1；高并发下载回 Table 50 聚合；游戏 UDP 固定 WAN1，游戏期间新下载切 WAN2。详见 [docs/MWAN3_WEB_BULK_GAME.md](docs/MWAN3_WEB_BULK_GAME.md)。
 
 ---
 
@@ -230,7 +230,7 @@ make package/luci-app-sufe-auth/compile V=s
 
 | 类别 | 识别 | 出口 |
 | :--- | :--- | :--- |
-| 网页 | LAN TCP 80/443，低并发 | 每客户端 sticky 一条 WAN |
+| 网页 | LAN TCP 80/443，低并发 | 每客户端 sticky 固定 WAN1 |
 | 下载 | 同源总并发 >10 且同目标 >8 | mark `0x300` -> Table 50 |
 | 游戏 | UDP 指定游戏端口 | WAN1 |
 | 游戏中的下载 | `game_active` 120 秒 | 新下载 mark `0x200` -> WAN2 |
