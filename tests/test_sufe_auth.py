@@ -294,3 +294,25 @@ class TestMacGate(unittest.TestCase):
         with mock.patch.object(sufe, "read_mac",
                                return_value=bytes.fromhex("aabbccddeeff")):
             self.assertFalse(client.mac_matches_config())
+
+
+class TestStartDestination(unittest.TestCase):
+    def _client(self, switch_mac):
+        cfg = sufe.Config(
+            section="wan", ifname="eth1", network="wan",
+            username="u", password="p", status_path="/tmp/sufe-start.json",
+            switch_mac=switch_mac,
+        )
+        return sufe.SufeAuthClient(cfg)
+
+    def test_start_is_single_unicast_to_switch(self):
+        client = self._client(bytes.fromhex("58aea8880c31"))
+        with mock.patch.object(client, "send_frame") as send:
+            client.send_start()
+        send.assert_called_once_with(bytes.fromhex("58aea8880c31"), sufe.EAPOL_START)
+
+    def test_start_falls_back_to_multicast_without_switch_mac(self):
+        client = self._client(None)
+        with mock.patch.object(client, "send_frame") as send:
+            client.send_start()
+        send.assert_called_once_with(sufe.PAE_GROUP, sufe.EAPOL_START)

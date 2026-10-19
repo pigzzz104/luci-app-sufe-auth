@@ -97,7 +97,7 @@ multicast -> 01:80:c2:00:00:03
 新进程第一次认证前：
   EAPOL-Logoff（清旧会话）
   -> 等 3 秒
-  -> 只发一个组播 EAPOL-Start
+  -> 只发一个单播 EAPOL-Start
 ```
 
 这不是旧版“每次恢复都 Logoff”，而是**每个进程生命周期只清一次**。
@@ -183,7 +183,7 @@ init
 
 - 所有等待都是 `select` + 单调时钟，没有嵌套 `sleep`/递归调用。
 - 每一轮认证只发 **一个** EAPOL-Start。
-- 第一次 Start 用标准 PAE 组播；收到交换机帧后才用学到的单播 MAC 重试。
+- 每轮只发一个**单播** EAPOL-Start 到交换机 MAC；学校文档明确要求“单播报文”。只有没有交换机 MAC 时才用 PAE 组播兜底。
 - EAP-Request 统一处理 Identity / H3C PAP (Type 7) / MD5 / Notification。
 - `wait_dhcp` 收到 EAP-Failure 立即重认证，不等 90 秒。
 - 物理恢复：`link down 15s -> up -> 等 carrier -> 重新认证`。
@@ -240,7 +240,7 @@ init
 单 Start 版本连续抓包：
 
 ```text
-13:22:57  Start (组播) -> Identity -> PAP -> Success
+13:22:57  Start (单播) -> Identity -> PAP -> Success
 13:23:11  Request -> Response -> Success
 13:23:26  Request -> Response -> Success
 13:23:41  Request -> Response -> Success
@@ -344,3 +344,43 @@ portal 认证/上游故障**。EAP-Success 只代表 RADIUS 认证通过，不�
 
 在网关恢复之前，`sufe_auth` 会保持 EAP 在线并保留租约；它无法替代校园网
 网关/portal。
+
+---
+
+## 10. 2026-10-19 13:47 追加：回查 Antigravity 开发历史后发现的关键遗漏
+
+回查 `ai_migration_export/conversations_markdown/02_OpenWrt_校园网认证配置.md`，
+原始逆向记录里有两条硬要求：
+
+1. 学校有线网要求 **“报文类型为单播报文”**；
+2. 学校存在 **MAC 地址绑定机制**，必须使用当初认证/注册的 MAC。
+
+本次重构为了避免“单播+组播双 Start 建立两个会话”，把首次 Start 改成了
+**组播优先**，这与原始记录冲突。组播 Start 可能让交换机产生一个能过
+EAP-Success、但数据 VLAN 未正确授权的半成品会话，表现就是 DHCP 正常、
+网关 ARP 不通。已在 2.0 中修正为：
+
+```text
+每轮只发一个 EAPOL-Start
+  -> 有 switch_mac：单播到 58:ae:a8:88:0c:31
+  -> 无 switch_mac：才用 01:80:c2:00:00:03 组播兜底
+```
+
+同时确认原始记录中的 Type 7 PAP 负载格式就是：
+
+```text
+len(password) + password + username
+```
+
+当前实现与之一致；EAP-MD5 兜底、EAPOL v1、交换机 MAC
+`58:ae:a8:88:0c:31` 也都一致，没有遗漏其他 802.1X 步骤。
+
+原始记录还确认了当初抓包成功的物理 WAN MAC 是 `00:78:32:26:60:5e`，
+与当前 `network.wan.macaddr`、`network.wan_eth1_dev.macaddr`、
+`sufe_auth.wan.mac` 一致。**如果学校系统登记的是另一台设备的 MAC，必须把
+这三处统一改成那个已登记 MAC；否则 EAP 可能过，但端口数据面仍会被 MAC
+绑定/端口安全丢弃。**
+
+当前剩余的数据面问题（EAP/DHCP 正常、`10.64.0.1` ARP 不通）仍按第 9 节
+处理：优先用另一台设备直插同一墙面端口对比，并联系管理员检查端口
+802.1X 授权 VLAN、MAC 绑定、port-security sticky MAC 和 DHCP snooping。

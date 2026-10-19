@@ -643,10 +643,10 @@ class SufeAuthClient:
         # (two EAP-Request/Identity with different IDs); the stale session later
         # sends EAP-Failure and de-authorizes the port.  Use unicast when the
         # switch MAC is known, multicast only as a retry/fallback.
-        if multicast or not self.switch_mac_learned:
-            # First contact uses the standard PAE group address.  A configured
-            # switch MAC is only a hint; H3C ports do not reliably answer a
-            # unicast-triggered Start until the client has been seen.
+        if multicast or not self.switch_mac:
+            # Fallback only: the campus documentation explicitly requires a
+            # unicast EAPOL-Start.  Use the PAE group only when no switch MAC
+            # is configured/learned at all.
             dst = PAE_GROUP
         else:
             dst = self.switch_mac
@@ -869,8 +869,9 @@ class SufeAuthClient:
             return
         self.auth_attempts = max(1, self.auth_attempts)
         log(f"authentication attempt {self.auth_attempts}/{self.cfg.auth_attempts}")
-        # One frame per attempt.  The first contact is multicast; after the
-        # switch has been heard, retries can use its unicast MAC.
+        # One frame per attempt, unicast to the switch.  The school requires
+        # "单播报文"; sending multicast first can produce an EAP-Success on a
+        # session whose data VLAN is never properly authorized.
         self.send_start()
         self.auth_deadline = monotonic() + self.cfg.auth_timeout
         self.auth_next = 0.0

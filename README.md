@@ -65,10 +65,10 @@ sh tools/fix_hnat_offload.sh rollback
 ## 功能特性
 
 - **纯原生实现**：基于 Python 3 原生 Socket 封装 IEEE 802.1X EAPOL 协议栈，无第三方扩展库依赖，运行内存占用小（单实例约 10MB）。
-- **协议兼容优化**：适配上财有线网 802.1X（H3C EAP-PAP Type 7 / EAP-MD5）交互流程；每轮认证只发 **一个** EAPOL-Start，避免 H3C 因单播+组播双 Start 建立重复会话并在稍后回 `EAP-Failure`。
+- **协议兼容优化**：适配上财有线网 802.1X（H3C EAP-PAP Type 7 / EAP-MD5）交互流程；每轮认证只发 **一个单播** EAPOL-Start 到交换机 MAC（学校明确要求“单播报文”），避免 H3C 因单播+组播双 Start 建立重复会话并在稍后回 `EAP-Failure`。
 - **确定性状态机**：`wait_link → auth → wait_dhcp → online → recover` 显式状态机，EAP-Success 后等待 90 秒 DHCP（大于 H3C 约 30 秒的数据 VLAN 放行延迟），不再在 30 秒时误发 Logoff。
 - **安全的恢复策略**：物理口做 15 秒 link reset；VLAN 口只做 Logoff + 重新认证，不触碰 `eth0`，不影响 LAN/WiFi；失败按 30/60/120/240/300 秒退避。
-- **启动会话清理**：每个进程第一次认证前发一次 Logoff 清掉旧会话，等 3 秒再发单组播 Start；停止/重启默认不发 Logoff，避免把正常端口踢下线。
+- **启动会话清理**：每个进程第一次认证前发一次 Logoff 清掉旧会话，等 3 秒再发一个单播 Start；停止/重启默认不发 Logoff，避免把正常端口踢下线。
 - **MAC 竞态防护**：不主动改 MAC，认证前等待 netifd 套用配置 MAC；每次发帧重新读取当前 MAC，避免绑定到开机随机 MAC。
 - **多实例架构**：支持在不同网卡或 VLAN 接口（如 `wan`、`wan2`、`wan3`）上独立运行认证进程，互不影响；每接口文件锁防止重复实例。
 - **凭据不进 `ps`**：procd 只传 `-n <section>`，账号密码由守护进程从 UCI 读取。
@@ -180,7 +180,7 @@ make package/luci-app-sufe-auth/compile V=s
      - 校园内网：`2023xxxxxx`
    - **上网密码**：校园网认证密码。
    - **物理 MAC 地址**：**必须填写**，且要与 `/etc/config/network` 的 `config device` / `config interface` 中的 `macaddr` 完全一致。MTK 驱动没有永久 MAC，开机会先生成随机 MAC；守护进程只校验和等待，**MAC 不一致时绝不发任何 EAPOL**，也不会自己改 MAC。netifd 负责套用配置 MAC。
-   - **交换机 MAC**：已内置宿舍交换机常用单播地址（`58:ae:a8:88:0c:31`），一般保持默认即可。首次 Start 使用标准组播地址，收到交换机帧后才会用该单播地址重试。
+   - **交换机 MAC**：已内置宿舍交换机常用单播地址（`58:ae:a8:88:0c:31`），一般保持默认即可。Start 始终单播到该 MAC；只有未配置/未学到交换机 MAC 时才用标准组播地址兜底。
 3. 点击页面右下角 **【保存并应用】**。
 
 ---
@@ -260,7 +260,7 @@ netifd: wan: Command failed: Permission denied
 2.0 的行为：
 
 - EAP-Success 后等待 **90 秒** DHCP，期间用 `SIGUSR1` 让 udhcpc 重发 Discover；
-- 每轮只发 **一个** EAPOL-Start（首次组播，学到交换机 MAC 后单播）；
+- 每轮只发 **一个单播** EAPOL-Start 到交换机 MAC；没有交换机 MAC 时才用组播兜底；
 - 每个进程首次认证前发一次 Logoff 清旧会话，等 3 秒再 Start；
 - 物理口恢复做 **15 秒** link reset；VLAN 口只 Logoff + 重认证，不碰 `eth0`；
 - `wait_dhcp` / `online` 收到 EAP-Failure 会立即重认证；
