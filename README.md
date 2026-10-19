@@ -55,7 +55,7 @@ ps w | grep '[h]nat-off' || echo "no daemon"
 
 ```bash
 sh tools/fix_hnat_offload.sh rollback
-# 或路由器本地：/root/rollback_hnat_off.sh
+# 路由器本地旧备份已清理，请使用仓库脚本执行回滚
 ```
 
 > 关闭 HNAT 只影响硬件 NAT 卸载，不影响路由、NAT、mwan3 或双线聚合；MT7981 的 CPU 足以处理 2×100Mbps。若你的设备没有 `/sys/kernel/debug/hnat/hook_toggle`，脚本会自动跳过。

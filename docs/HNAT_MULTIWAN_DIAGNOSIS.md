@@ -137,13 +137,8 @@ HNAT 在 WiFi 路径上缓存 NAPT 流，部分 TCP 流在 20KB 窗口处被卡�
    - `/etc/init.d/hnat-off`：`START=99`，开机后写 0 并退出；`enable` 后生成 `S99hnat-off`。
    - `/etc/hotplug.d/iface/99-hnat-off`：WAN/WiFi 接口 `ifup` 时再写 0，覆盖网络重载/重启场景。
    - 可选 `install-watchdog`：额外安装常驻巡检（约 1 MB 内存、0% CPU、每 10 秒检查一次），用于防止手动重开 TurboACC 后无人值守。
-5. 备份：
-   - `/root/firewall.bak.20261018_160306`
-   - `/root/firewall.bak2.20261018_160611`
-   - `/root/rc.local.bak.20261018_160611`
-   - `/root/sysctl.conf.bak.20261018_160611`
-   - `/root/turboacc.bak.20261018_160611`
-   - `/root/turboacc.symlink.20261018_160611`
+5. 备份：路由器本地旧备份已清理；需要回滚时使用仓库脚本
+   `tools/fix_hnat_offload.sh rollback`（它会重新写入 HNAT/TurboACC 配置）。
 
 ### 5.2 项目内可复现脚本
 
@@ -154,13 +149,7 @@ HNAT 在 WiFi 路径上缓存 NAPT 流，部分 TCP 流在 20KB 窗口处被卡�
 
 ### 5.3 回滚
 
-路由器本地已放置：
-
-```bash
-/root/rollback_hnat_off.sh
-```
-
-或：
+路由器本地旧回滚脚本已清理，使用仓库脚本：
 
 ```bash
 sh tools/fix_hnat_offload.sh rollback

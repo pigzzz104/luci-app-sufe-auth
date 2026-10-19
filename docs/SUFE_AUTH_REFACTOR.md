@@ -279,24 +279,20 @@ python3 -m py_compile root/usr/sbin/sufe_auth
 
 ## 7. 回滚
 
-路由器上保留了部署前备份：
-
-```text
-/root/sufe_auth.bak.20261019_131212
-/root/sufe_auth.init.bak.20261019_131212
-/root/sufe_auth.config.bak.20261019_131212
-```
-
-回滚：
+路由器本地不再保留旧版文件备份；唯一回滚点是 GitHub 上的重构前提交
+`32bfc98`。需要时从仓库恢复：
 
 ```bash
-cp /root/sufe_auth.bak.20261019_131212 /usr/sbin/sufe_auth
-cp /root/sufe_auth.init.bak.20261019_131212 /etc/init.d/sufe_auth
+git clone https://github.com/pigzzz104/luci-app-sufe-auth.git /tmp/sufe-auth-rollback
+git -C /tmp/sufe-auth-rollback checkout 32bfc98
+cp /tmp/sufe-auth-rollback/root/usr/sbin/sufe_auth /usr/sbin/sufe_auth
+cp /tmp/sufe-auth-rollback/root/etc/init.d/sufe_auth /etc/init.d/sufe_auth
 chmod +x /usr/sbin/sufe_auth /etc/init.d/sufe_auth
 /etc/init.d/sufe_auth restart
 ```
 
-回滚版会恢复旧的 Logoff/2 秒 bounce 行为，不建议长期使用。
+注意：`32bfc98` 就是存在冷启动/Logoff-2 秒 bounce 问题的旧版本，只用于对照
+或紧急回退，不建议长期运行。
 
 ---
 
