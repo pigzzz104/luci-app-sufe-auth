@@ -38,7 +38,7 @@ Optional tuning options (defaults are deliberately conservative):
     option auth_attempts '5'
     option recovery_settle '10'
     option recovery_link_down '15'
-    option mac_settle_timeout '30'    # wait for netifd to apply the configured MAC
+    option mac_settle_timeout '30'    # warning interval while waiting for the MAC
     option startup_logoff '1'         # clear a stale switch session once per process
     option startup_logoff_wait '3'
     option recovery_link_up_wait '25'

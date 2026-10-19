@@ -240,7 +240,7 @@ init
 单 Start 版本连续抓包：
 
 ```text
-13:22:57  Start (单播) -> Identity -> PAP -> Success
+Start (单播) -> Identity -> PAP -> Success
 13:23:11  Request -> Response -> Success
 13:23:26  Request -> Response -> Success
 13:23:41  Request -> Response -> Success
@@ -261,11 +261,12 @@ init
 
 - `root/usr/sbin/sufe_auth`：单文件 Python 3 守护进程，约 1000 行。
 - `root/etc/init.d/sufe_auth`：procd 只传 `-n <section>`，密码不再进 `ps`。
-- `tests/test_sufe_auth.py`：22 个单元测试，覆盖：
+- `tests/test_sufe_auth.py`：24 个单元测试，覆盖：
   - EAPOL/EAP 编解码、VLAN tag、MD5/PAP；
   - 配置解析、MAC 校验、布尔/浮点边界；
   - 物理/VLAN 恢复序列（确保物理口不 Logoff、VLAN 口不 reset link）；
-  - startup MAC gate、恢复退避上限。
+  - startup MAC gate、恢复退避上限；
+  - 单播 Start 目标（有/无 switch_mac）。
 
 运行：
 

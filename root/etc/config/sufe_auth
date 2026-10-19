@@ -17,4 +17,4 @@ config account 'wan'
 #	option startup_logoff_wait '3'
 #	option logoff_on_stop '0'          # 停止/重启时不主动发 Logoff
 #	option eapol_version '1'
-#	option mac_settle_timeout '30'     # 等 netifd 套用配置 MAC
+#	option mac_settle_timeout '30'     # MAC 不一致时告警间隔
