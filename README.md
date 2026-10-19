@@ -102,8 +102,12 @@ luci-app-sufe-auth/
 │   ├── etc/
 │   │   ├── config/
 │   │   │   └── sufe_auth                  # UCI 配置文件模板
-│   │   └── init.d/
-│   │       └── sufe_auth                  # OpenWrt procd 守护服务脚本
+│   │   ├── init.d/
+│   │   │   └── sufe_auth                  # OpenWrt procd 守护服务脚本
+│   │   ├── mwan3.user                     # Table 50 + web/bulk/game 分类
+│   │   └── hotplug.d/
+│   │       └── iface/
+│   │           └── 99-mwan3-user          # ifup/ifdown 后重建分类链
 │   └── usr/
 │       ├── lib/
 │       │   └── lua/
