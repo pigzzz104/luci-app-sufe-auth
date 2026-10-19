@@ -251,7 +251,7 @@ iptables -t mangle -S mwan3_rules
 iptables -t mangle -S mwan3_policy_web_affinity
 iptables -t mangle -S PREROUTING
 ipset list mwan3_sticky_v4_web_sticky
-ipset list game_active
+iptables -t nat -S MWAN3_WAN2_SNAT
 ip route show table 50
 ```
 

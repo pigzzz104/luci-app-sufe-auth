@@ -64,8 +64,7 @@ WAN2 网页路径已用真实手机 `.137` 验证：临时规则下 112 条新 4
 ```text
 TCP 80/443 NEW，源 192.168.6.0/24
   ├─ 源总并发 >10 -> WEB_BULK_CHECK
-  │    ├─ 源在 game_active -> mark 0x200 (WAN2)，返回
-  │    └─ 同一目标 >8     -> mark 0x300 (Table 50)，返回
+  │    └─ 同一目标 >8 -> mark 0x300 (Table 50)，返回
   └─ 否则保持 mwan3 的 web sticky 标记
 ```
 
@@ -73,7 +72,7 @@ TCP 80/443 NEW，源 192.168.6.0/24
 
 - `mwan3_hook` 开头有 `CONNMARK --restore-mark`，会覆盖之前打的 mark；
 - 因此先让 mwan3 完成 web sticky / connected 逻辑；
-- 再由 `WEB_CLASSIFY` 覆盖 bulk/game 的标记；
+- 再由 `WEB_CLASSIFY` 覆盖 bulk 的标记；
 - 链尾执行 `CONNMARK --save-mark`，保证后续包保持新类别。
 
 `xt_connlimit` 在这台固件上不能把 `--connlimit-saddr` 和 `--connlimit-daddr`
@@ -104,6 +103,7 @@ WEB_BULK_CHECK: -m connlimit --connlimit-above 8 --connlimit-daddr -j MARK 0x300
 ```text
 root/etc/mwan3.user
 root/etc/hotplug.d/iface/99-mwan3-user
+root/etc/rc.local
 tools/configure_mwan3.sh
 ```
 
@@ -143,29 +143,32 @@ iptables -t mangle -S PREROUTING
 iptables -t mangle -S WEB_CLASSIFY
 iptables -t mangle -S WEB_BULK_CHECK
 
-# game_active 与 Table 50
-ipset list game_active
+# WAN2 SNAT / connected 修复
+iptables -t nat -S MWAN3_WAN2_SNAT
+iptables -t mangle -S mwan3_hook | tail -3
+iptables -t mangle -S mwan3_rule_web_sticky
+
+# Table 50
 ip route show table 50
 ```
 
 本次实测：
 
-- `.186 -> 0x100 (WAN1)`，`.198 -> 0x200 (WAN2)`，两个客户端已分散；
+- 手机 `.137` 强制 WAN2：112 条新 443 连接 `mark=0x200`，WAN2 回程 218 条，
+  最大响应 644,060 字节，页面/图片正常；
 - 20 条同目标慢连接：`WEB_BULK_CHECK` 的 `dst >8` 命中，conntrack 出现
   `mark=0x300`；
-- 手动写入 `game_active 192.168.6.1` 后，新 bulk 的 `WEB_BULK_CHECK` game 规则
-  命中 `0x200`，generic 0x300 计数为 0；
 - 两条 WAN 网关均 0% 丢包，百度 HTTP 200。
 
 ---
 
 ## 7. 代价与边界
 
-- 网页固定单 WAN 后，普通网页下载不再聚合；高并发下载通过 bulk 旁路恢复。
+- 网页按客户端 sticky 单 WAN；单个客户端网页下载不聚合，高并发下载通过 bulk 旁路恢复。
 - 阈值 10/8 是行为阈值；浏览器极端多标签可能被误判为 bulk。可按需调整。
 - 现有连接不会迁移；规则只影响新连接。
-- 游戏检测依赖端口列表；未列出的游戏不会触发自动切 WAN2，但游戏本身仍走 WAN1。
-- 没有 CAKE/HTB/IFB/tc，无法做精确 12MB/s 限速；游戏时是路径隔离到 WAN2。
+- 游戏 UDP 固定 WAN1；自动“游戏期间下载切 WAN2”当前关闭。
+- 没有 CAKE/HTB/IFB/tc，无法做精确 12MB/s 限速。
 - mwan3 运行时 restart 在这台固件可能卡 hotplug 锁；配置变更后用重启加载。
 
 ---
@@ -256,3 +259,24 @@ WeGame/Baidu/图片页面: 正常
 
 另一个问题是 `game_active` 误判：Mac 普通 UDP 被游戏端口规则收录，浏览器 bulk
 连接被强制 WAN2。现已停用自动切换，清空 `game_active`，游戏 UDP 仍固定 WAN1。
+
+
+---
+
+## 11. WAN2 SNAT 与 connected 修复
+
+WAN2 是 `eth0.2` VLAN，和 WAN1 共用校园网关。当前使用：
+```text
+-A MWAN3_WAN2_SNAT -s 192.168.6.0/24 -o eth0.2 -j SNAT --to-source <WAN2 IP>
+```
+并在 POSTROUTING 最前面跳转该链，绕过 fullcone MASQUERADE。
+
+同时删除 `mwan3_hook` 末尾的：
+```text
+-A mwan3_hook -m mark ! --mark 0x3f00/0x3f00 -j mwan3_connected
+```
+否则 WAN→LAN 回程会被重新标成 `0x3f00` 并覆盖 web/bulk 的 connmark。
+
+table 2 的连通路由由 mwan3 自己维护，`mwan3.user` 不再和它争抢；
+WAN2 网页已用真实手机验证。`/etc/rc.local` 在 WAN2 online 后补跑一次
+`mwan3.user`，避免 firewall 刷新掉 SNAT；iface hotplug 也延迟 5 秒。
