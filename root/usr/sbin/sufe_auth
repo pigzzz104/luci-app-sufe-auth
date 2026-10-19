@@ -702,7 +702,10 @@ class SufeAuthClient:
         elif self.state in (STATE_WAIT_DHCP, STATE_ONLINE):
             # A repeated EAP-Success must not extend the DHCP grace window;
             # otherwise a switch that keeps answering could hide a dead port.
-            log(f"switch refreshed authentication (EAP-ID {frame.eap_id})")
+            # This is a normal switch-side EAP-Success refresh, often every
+            # 15 seconds per WAN.  Do not log it: at debug level logread still
+            # stores it and the ring buffer fills with control-plane noise.
+            pass
 
     def on_failure(self, frame: Frame) -> None:
         self.last_error = f"EAP-Failure (ID {frame.eap_id})"
