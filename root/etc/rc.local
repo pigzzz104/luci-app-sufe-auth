@@ -1,0 +1,18 @@
+#!/bin/sh
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+
+# mwan3 WAN2/connected post-fix: firewall may flush NAT after the iface
+# hotplug. Wait for WAN2 to be online, then rebuild the WAN2 SNAT and
+# classification chains.
+(
+    i=0
+    while [ $i -lt 30 ]; do
+        [ "$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)" = "online" ] && break
+        sleep 2
+        i=$((i + 1))
+    done
+    [ -x /etc/mwan3.user ] && /etc/mwan3.user >/dev/null 2>&1
+) &
+
+exit 0

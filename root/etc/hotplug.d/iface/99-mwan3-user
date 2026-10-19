@@ -5,5 +5,7 @@ case "$ACTION" in
     ifup|ifdown) ;;
     *) exit 0 ;;
 esac
+# Let firewall finish its reload before touching NAT/classification chains.
+sleep 5
 [ -x /etc/mwan3.user ] && /etc/mwan3.user >/dev/null 2>&1
 exit 0

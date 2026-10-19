@@ -178,6 +178,7 @@ config rule 'game_high_udp'
 
 config policy 'web_affinity'
 	list use_member 'wan_m1_w1'
+	list use_member 'wan2_m1_w1'
 
 config rule 'web_sticky'
 	option src_ip '192.168.6.0/24'
@@ -254,17 +255,24 @@ sync_mwan3_multipath() {
 }
 
 sync_web_affinity_policy() {
-    # Web traffic is pinned to WAN1. WAN2's forwarded/NAT path currently
-    # stalls on large TLS responses (HTTPS image/page bodies), while WAN1
-    # completes the same transfers. WAN2 remains available for Table 50
-    # downloads and non-web traffic.
+    # mwan3 generates this chain from the policy at boot.  Rebuild it after
+    # both WANs are up: new clients are split 50/50, then mwan3's sticky set
+    # keeps each source IP on the selected WAN.
     iptables -t mangle -N mwan3_policy_web_affinity 2>/dev/null
     iptables -t mangle -F mwan3_policy_web_affinity 2>/dev/null
 
     local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
     local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
 
-    if [ "$wan1_st" = "online" ]; then
+    if [ "$wan1_st" = "online" ] && [ "$wan2_st" = "online" ]; then
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -m statistic --mode random --probability 0.5 \
+            -j MARK --set-xmark 0x200/0x3f00
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -j MARK --set-xmark 0x100/0x3f00
+    elif [ "$wan1_st" = "online" ]; then
         iptables -t mangle -A mwan3_policy_web_affinity \
             -m mark --mark 0x0/0x3f00 \
             -j MARK --set-xmark 0x100/0x3f00
@@ -369,6 +377,7 @@ case "$ACTION" in
     ifup|ifdown) ;;
     *) exit 0 ;;
 esac
+sleep 5
 [ -x /etc/mwan3.user ] && /etc/mwan3.user >/dev/null 2>&1
 exit 0
 EOF

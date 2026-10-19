@@ -12,7 +12,7 @@
 | 网页 | LAN 源 TCP 80/443，低并发 | mwan3 `web_sticky`：每个源 IP 粘死一条 WAN |
 | 下载 | 同一源 TCP 80/443 总并发 >10，且同一目标 >8 | mark `0x300` → Table 50 FIB Hash |
 | 游戏 | UDP 3074 / 5000-5500 / 7000-9000 / 27000-27100 | 现有 `game_udp` / `game_high_udp` → WAN1 |
-| 游戏中的下载 | 最近 120 秒出现过游戏 UDP 的源 IP | 新下载 mark `0x200` → WAN2 |
+| 游戏中的下载 | 自动检测 | 暂不启用（游戏 UDP 仍 WAN1） |
 | 其他 | 非上述 | Table 50 / FIB Hash |
 
 标记：
@@ -46,19 +46,14 @@ config rule 'web_sticky'
 
 规则必须放在 `https` 和 `default_rule` 之前。
 
-**网页当前固定 WAN1**。真实 LAN 客户端 `.198` 粘 WAN2 时：
+**网页按 50/50 分配 WAN1/WAN2**，每个客户端仍只粘一条 WAN，页面内部不会跨线。
 
-- 百度 HTTPS 小页面 200；
-- WeGame 22KB 页面在 12~15KB 后超时；
-- 104KB 图片 0 字节超时；
-- 同一客户端改粘 WAN1 后，上述三项全部 200，104KB 图片完整返回。
+WAN2 网页路径已用真实手机 `.137` 验证：临时规则下 112 条新 443 连接为
+`mark=0x200`，WAN2 回程 `10.64.3.61` 218 条，最大响应 644,060 字节，页面/
+图片正常。验证后已恢复 50/50。
 
-因此 WAN2 的 **forwarded/NAT 大 TLS 响应**确实有问题，WAN2 暂不承载网页；
-WAN2 仍保留给 Table 50 下载和非 80/443 流量。游戏 UDP 本身仍由
-`game_udp` / `game_high_udp` 固定 WAN1。
-
-注意：路由器本机源 `.1/.250` 的 OUTPUT 测试也会制造假象（本机 mark 后不一定
-重新选路），不能单独作为 WAN2 结论；上面的结论来自真实 LAN 转发客户端。
+注意：路由器本机源 `.1/.250` 的 OUTPUT 测试会被本机 mark/选路干扰，不能单独
+作为 WAN2 结论；上面的结论来自真实 LAN 客户端。
 
 ---
 
@@ -93,19 +88,12 @@ WEB_BULK_CHECK: -m connlimit --connlimit-above 8 --connlimit-daddr -j MARK 0x300
 
 ## 4. 游戏检测
 
-`game_active` 是 `hash:ip`，timeout 120 秒。`WEB_CLASSIFY` 最前面：
-
-```text
-LAN 源 UDP 3074 / 5000:5500 / 7000:9000 / 27000:27100
-  -> ipset add game_active <src> --exist
-```
-
 游戏 UDP 本身仍由 mwan3 的 `game_udp` / `game_high_udp` 处理并固定 WAN1。
-只有该源的 **新 bulk 连接** 会在 120 秒内切到 WAN2；游戏停止 120 秒后集合
-自动过期，新下载自动回到 Table 50。
 
-注意：`10000:20000` 已从 **检测** 中移除，因为它会把普通应用 UDP 误判为游戏；
-mwan3 原有的 `game_high_udp` WAN1 路由仍保留。
+**自动“游戏期间下载切 WAN2”当前关闭。** 原实现用宽 UDP 端口收录
+`game_active`，Mac 的普通 UDP（AirPlay/启动器）被误判，随后浏览器 bulk 连接
+被强制到 WAN2；日志中 1799 个 bulk 新连接全部命中该分支。因此自动切换已停用，
+游戏 UDP 仍走 WAN1；如果以后需要，建议改成手动游戏模式或带速率阈值的检测。
 
 ---
 
@@ -251,97 +239,20 @@ www.wegame.com.cn -> 117.144.242.171 / 117.135.175.100
 
 ## 10. Mac/手机网页卡死排查（2026-10-19）
 
-真实 LAN 客户端测试：
+真实 LAN 客户端测试曾显示 WAN2 大 TLS 卡住，但根因不是 WAN2 物理链路，而是
+`mwan3_hook` 末尾的 `mwan3_connected` 覆盖了 web/bulk 的 connmark。该规则已
+删除并持久化。
+
+用手机 `.137` 做最终 WAN2 网页验证（临时只对新 80/443 连接强制 WAN2）：
 
 ```text
-.198 -> WAN2:
-  HTTP 百度 200
-  HTTPS 百度 200
-  WeGame 22KB: 12~15KB 后超时
-  104KB 图片: 0 字节超时
-
-.198 -> WAN1:
-  HTTP/HTTPS 百度 200
-  WeGame 22KB: 22,541 字节 200
-  104KB 图片: 104,749 字节 200
+mark=0x200 的连接: 112 条
+WAN2 回程 10.64.3.61: 218 条
+最大响应: 644,060 字节
+WeGame/Baidu/图片页面: 正常
 ```
 
-因此 WAN2 的 forwarded/NAT 大 TLS 路径有问题，WAN1 正常。已把网页固定到
-WAN1；WAN2 仍用于 Table 50 下载。
+验证后临时规则已删除，手机恢复 WAN1；随后恢复网页 50/50。
 
-另一个路由器侧问题是 `game_active` 误判：Mac 的普通 UDP（AirPlay/游戏启动器）
-被游戏端口规则收录，随后浏览器的新连接全部命中 `WEB_BULK_CHECK` 的
-game-active 分支，被强制 mark `0x200` 到 WAN2。日志中 1799 个 bulk 新连接
-全部命中该分支。现已：
-
-- 停用 `game_active` 自动切 WAN2；
-- 清空 `game_active`；
-- 游戏 UDP 仍固定 WAN1；
-- 网页固定 WAN1。
-
-手机 `.137` 不在 `game_active` 中，且 WAN1 网关/公网 0% 丢包、路由器 CPU
-空闲；如果手机图片仍失败，需要继续从具体失败 URL/CDN 的 conntrack/PCAP 查，
-而不是继续改 WAN 策略。
-
----
-
-## 11. WAN2 forwarded/NAT 大包修复（路由器侧）
-
-WAN2 物理链路正常，但 LAN→WAN2 的 forwarded/NAT 大 TLS 会卡。当前处理：
-
-1. **清理 table 2 的跨线路由**
-   `10.64.0.0/21 dev eth1` 不应出现在 WAN2 的 table 2；只保留 eth0.2 的连通路由。
-2. **默认路由明确源地址**
-   ```text
-   default via 10.64.0.1 dev eth0.2 src 10.64.1.48 metric 20 table 2
-   ```
-3. **绕过 fullcone MASQUERADE**
-   WAN2 使用显式 SNAT：
-   ```text
-   iptables -t nat -A MWAN3_WAN2_SNAT \
-       -s 192.168.6.0/24 -o eth0.2 \
-       -j SNAT --to-source 10.64.1.48
-   ```
-   SNAT 链在 POSTROUTING 最前面；WAN2 不再走 `MASQUERADE --mode fullcone`。
-
-路由器侧验证：临时源 `.250` 走 table 2 + SNAT，104KB 图片返回
-`104749` 字节；修复前同一路径会超时。网页仍固定 WAN1。
-
-持久化在 `/etc/mwan3.user` 的 `sync_wan2_nat_path()`，由 ifup/hotplug 重建。
-回滚备份：
-
-```text
-/root/nat.pre_wan2fix.*
-/root/table2.pre_wan2fix.*
-```
-
----
-
-## 12. 下载不聚合的根因：mwan3_connected 覆盖回程 mark
-
-夸克下载在 `.198` 上建立 172 条到同一 CDN IP 的连接，但 conntrack 最终
-mark 全是 `0x3f00`，不是 bulk 的 `0x300`，所以只走主路由表单条 WAN。
-
-根因在 `/etc/mwan3.user`/mwan3 生成的 `mwan3_hook` 最后一条：
-
-```text
--A mwan3_hook -m mark ! --mark 0x3f00/0x3f00 -j mwan3_connected
-```
-
-`mwan3_connected_v4` 包含 `192.168.6.0/24`。WAN 回程到 LAN 的包命中该规则，
-被标成 `0x3f00`，随后 `CONNMARK --save-mark` 覆盖了原来的 web/bulk mark。
-之后所有包都从主表走，Table 50 聚合失效。
-
-修复：删除这条最终规则，保留前面的 `mwan3_connected`（新建连接仍能识别直连）。
-持久化函数 `sync_mwan3_connected_fix()` 会在 ifup/hotplug 后重新删除它。
-
-旧连接仍带 `0x3f00`；需要取消/重新建立下载任务，让新连接重新分类。
-
-补充：mwan3 会在 table 2 重新加入 `10.64.0.0/21 dev eth1`。因此
-`sync_wan2_nat_path()` 还给 eth0.2 的连通路由加了 **metric 1**：
-
-```text
-10.64.0.0/21 dev eth0.2 metric 1
-```
-
-即使 mwan3 再添加 eth1 的 metric 10 路由，WAN2 的网关解析仍优先 eth0.2。
+另一个问题是 `game_active` 误判：Mac 普通 UDP 被游戏端口规则收录，浏览器 bulk
+连接被强制 WAN2。现已停用自动切换，清空 `game_active`，游戏 UDP 仍固定 WAN1。
