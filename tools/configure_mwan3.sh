@@ -275,6 +275,30 @@ sync_web_affinity_policy() {
     fi
 }
 
+sync_wan2_nat_path() {
+    # WAN2 is a VLAN on eth0.2 and shares the campus gateway with WAN1.
+    # Remove WAN1's connected route from table 2, give the WAN2 default route
+    # an explicit source, and bypass the fullcone MASQUERADE with explicit
+    # SNAT. This keeps WAN2 downloads from taking the wrong return path.
+    local ip2 gw2
+    ip2=$(ip -4 addr show eth0.2 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)
+    gw2=$(ip route show dev eth0.2 2>/dev/null | awk '$1 == "default" {print $3; exit}')
+    [ -n "$ip2" ] || return 0
+    [ -n "$gw2" ] || gw2=10.64.0.1
+
+    ip route del 10.64.0.0/21 dev eth1 table 2 2>/dev/null
+    ip route del default via "$gw2" dev eth0.2 table 2 2>/dev/null
+    ip route replace default via "$gw2" dev eth0.2 src "$ip2" metric 20 table 2 2>/dev/null
+
+    iptables -t nat -N MWAN3_WAN2_SNAT 2>/dev/null
+    iptables -t nat -F MWAN3_WAN2_SNAT 2>/dev/null
+    iptables -t nat -A MWAN3_WAN2_SNAT \
+        -s 192.168.6.0/24 -o eth0.2 \
+        -j SNAT --to-source "$ip2"
+    iptables -t nat -C POSTROUTING -j MWAN3_WAN2_SNAT 2>/dev/null || \
+        iptables -t nat -I POSTROUTING 1 -j MWAN3_WAN2_SNAT
+}
+
 sync_traffic_classification() {
     command -v ipset >/dev/null 2>&1 || return 0
 
@@ -320,6 +344,7 @@ sync_traffic_classification() {
 }
 
 sync_mwan3_multipath
+sync_wan2_nat_path
 sync_web_affinity_policy
 sync_traffic_classification
 EOF

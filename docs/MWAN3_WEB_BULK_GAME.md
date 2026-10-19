@@ -282,3 +282,35 @@ game-active 分支，被强制 mark `0x200` 到 WAN2。日志中 1799 个 bulk �
 手机 `.137` 不在 `game_active` 中，且 WAN1 网关/公网 0% 丢包、路由器 CPU
 空闲；如果手机图片仍失败，需要继续从具体失败 URL/CDN 的 conntrack/PCAP 查，
 而不是继续改 WAN 策略。
+
+---
+
+## 11. WAN2 forwarded/NAT 大包修复（路由器侧）
+
+WAN2 物理链路正常，但 LAN→WAN2 的 forwarded/NAT 大 TLS 会卡。当前处理：
+
+1. **清理 table 2 的跨线路由**
+   `10.64.0.0/21 dev eth1` 不应出现在 WAN2 的 table 2；只保留 eth0.2 的连通路由。
+2. **默认路由明确源地址**
+   ```text
+   default via 10.64.0.1 dev eth0.2 src 10.64.1.48 metric 20 table 2
+   ```
+3. **绕过 fullcone MASQUERADE**
+   WAN2 使用显式 SNAT：
+   ```text
+   iptables -t nat -A MWAN3_WAN2_SNAT \
+       -s 192.168.6.0/24 -o eth0.2 \
+       -j SNAT --to-source 10.64.1.48
+   ```
+   SNAT 链在 POSTROUTING 最前面；WAN2 不再走 `MASQUERADE --mode fullcone`。
+
+路由器侧验证：临时源 `.250` 走 table 2 + SNAT，104KB 图片返回
+`104749` 字节；修复前同一路径会超时。网页仍固定 WAN1。
+
+持久化在 `/etc/mwan3.user` 的 `sync_wan2_nat_path()`，由 ifup/hotplug 重建。
+回滚备份：
+
+```text
+/root/nat.pre_wan2fix.*
+/root/table2.pre_wan2fix.*
+```
