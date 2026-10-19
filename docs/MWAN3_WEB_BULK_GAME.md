@@ -200,3 +200,47 @@ reboot
 
 `iptables`/`ipset` 的临时快照已清理；新规则由 `/etc/mwan3.user` 和
 `/etc/hotplug.d/iface/99-mwan3-user` 在启动/ifup 时重建。
+
+---
+
+## 9. 历史问题站点回归（2026-10-19 19:50）
+
+按迁移对话里实际出现过的 URL / 域名，从 WAN1、WAN2 强制源地址各测一次：
+
+| 对象 | WAN1 | WAN2 | 说明 |
+| :--- | :--- | :--- | :--- |
+| LoL 英雄图 `game.gtimg.cn/.../Aatrox.png` | 200 / 17,022 B | 200 / 17,022 B | 正常 |
+| LoL 皮肤图 `ossweb-img.qq.com/.../big1000.jpg` | 200 / 104,749 B | 200 / 104,749 B | 10/10 次成功 |
+| WeGame 首页 `www.wegame.com.cn` | 200 / 22,541 B | 200 / 22,541 B | 正常 |
+| B 站 API `api.bilibili.com/x/web-interface/popular` | 200 / 2,181 B | 200 / 2,181 B | 正常 |
+| B 站旧封面 `i0.hdslb.com/...` | 404 | 404 | URL 已过期 |
+| 微博旧头像 `tvax1.sinaimg.cn/...` | 403 | 403 | 防盗链/URL 过期 |
+| 知乎旧图 `picx.zhimg.com/...` | 404 | 404 | URL 已过期 |
+| 百度 | 200 | 200 | 对照 |
+
+多 A 记录：
+
+```text
+www.wegame.com.cn -> 117.144.242.171 / 117.135.175.100
+两个 A 都返回 302（正常跳转）；
+同一测试源在 mwan3_sticky_v4_web_sticky 中只有一个 0x200 条目。
+```
+
+其他：
+
+- `grep -c NAPT /sys/kernel/debug/hnat/hnat_entry` = 0；
+- `Reject-QUIC-UDP443` 仍在；
+- 游戏 UDP `36.155.166.81:8081` 的 conntrack mark=0x100（WAN1）；
+- 真实 LAN 客户端 sticky：`.198 -> 0x200`，`.186/.229 -> 0x100`。
+
+注意：路由器本机源 `.1/.250` 的大响应测试会被 **OUTPUT 没有 FORWARD 的 TCPMSS clamp** 干扰，出现“小 API 正常、大图片 1KB 后超时”。这不是 LAN 客户端结论；上表使用强制 WAN1/WAN2 源地址验证站点本身，真实 LAN 转发路径有 `FORWARD TCPMSS --clamp-mss-to-pmtu`。
+
+游戏平台补充：
+
+| 域名 | 结果 |
+| :--- | :--- |
+| `arena.5eplay.com` | 200 |
+| `store.steampowered.com` | 200 |
+| `battlenet.com.cn` | 403（站点/区域策略） |
+| `5eplay.com` | 两 WAN 均超时（站点侧） |
+| `cn.actual.battle.net` | 快速连接失败（域名/站点侧） |
