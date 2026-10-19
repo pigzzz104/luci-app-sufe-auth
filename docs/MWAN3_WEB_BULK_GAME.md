@@ -336,3 +336,12 @@ mark 全是 `0x3f00`，不是 bulk 的 `0x300`，所以只走主路由表单条 
 持久化函数 `sync_mwan3_connected_fix()` 会在 ifup/hotplug 后重新删除它。
 
 旧连接仍带 `0x3f00`；需要取消/重新建立下载任务，让新连接重新分类。
+
+补充：mwan3 会在 table 2 重新加入 `10.64.0.0/21 dev eth1`。因此
+`sync_wan2_nat_path()` 还给 eth0.2 的连通路由加了 **metric 1**：
+
+```text
+10.64.0.0/21 dev eth0.2 metric 1
+```
+
+即使 mwan3 再添加 eth1 的 metric 10 路由，WAN2 的网关解析仍优先 eth0.2。

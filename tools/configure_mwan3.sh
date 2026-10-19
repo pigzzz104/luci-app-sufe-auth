@@ -287,6 +287,7 @@ sync_wan2_nat_path() {
     [ -n "$gw2" ] || gw2=10.64.0.1
 
     ip route del 10.64.0.0/21 dev eth1 table 2 2>/dev/null
+    ip route replace 10.64.0.0/21 dev eth0.2 proto static scope link metric 1 table 2 2>/dev/null
     ip route del default via "$gw2" dev eth0.2 table 2 2>/dev/null
     ip route replace default via "$gw2" dev eth0.2 src "$ip2" metric 20 table 2 2>/dev/null
 
