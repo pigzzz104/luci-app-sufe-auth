@@ -176,6 +176,18 @@ config rule 'game_high_udp'
 	option timeout '3600'
 	option use_policy 'wan_pref'
 
+config policy 'web_affinity'
+	list use_member 'wan_m1_w1'
+	list use_member 'wan2_m1_w1'
+
+config rule 'web_sticky'
+	option src_ip '192.168.6.0/24'
+	option proto 'tcp'
+	option dest_port '80,443'
+	option sticky '1'
+	option timeout '3600'
+	option use_policy 'web_affinity'
+
 config rule 'https'
 	option proto 'tcp'
 	option dest_port '443'
@@ -192,29 +204,33 @@ EOF
 echo "部署 /etc/mwan3.user 同步脚本..."
 cat << 'EOF' > /etc/mwan3.user
 #!/bin/sh
-# Multi-WAN Kernel FIB Multipath Sync Script
-# Manages Table 50 for deterministic (src_ip, dst_ip) flow hashing
+# Three-class multi-WAN policy for luci-app-sufe-auth.
+#
+#   web    : TCP 80/443, low concurrency -> per-client sticky WAN (mwan3)
+#   bulk   : TCP 80/443, >10 total and >8 to one destination -> Table 50 FIB hash
+#   game   : UDP game ports -> WAN1; recent game source -> new bulk to WAN2
+#   other  : Table 50 FIB hash
+#
+# This file is sourced by /etc/firewall.user and by the iface hotplug hook.
+# It must stay idempotent: it runs on firewall reload and on every ifup/ifdown.
+
+LOG="logger -t mwan3-user"
 
 sync_mwan3_multipath() {
     sysctl -w net.ipv4.fib_multipath_hash_policy=0 >/dev/null 2>&1
-    local nexthops=""
+
     local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
     local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
     local wan3_st=$(cat /var/run/mwan3/iface_state/wan3 2>/dev/null)
 
-    # 动态探测各网卡网关
-    local gw1=$(ip route show dev eth1 2>/dev/null | awk '/default/ {print $3}')
-    [ -z "$gw1" ] && gw1=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+    local gw1=$(ip route show dev eth1 2>/dev/null | awk '$1 == "default" {print $3; exit}')
     [ -z "$gw1" ] && gw1="10.64.0.1"
-
-    local gw2=$(ip route show dev eth0.2 2>/dev/null | awk '/default/ {print $3}')
-    [ -z "$gw2" ] && gw2=$(ubus call network.interface.wan2 status 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+    local gw2=$(ip route show dev eth0.2 2>/dev/null | awk '$1 == "default" {print $3; exit}')
     [ -z "$gw2" ] && gw2="$gw1"
-
-    local gw3=$(ip route show dev eth0.3 2>/dev/null | awk '/default/ {print $3}')
-    [ -z "$gw3" ] && gw3=$(ubus call network.interface.wan3 status 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+    local gw3=$(ip route show dev eth0.3 2>/dev/null | awk '$1 == "default" {print $3; exit}')
     [ -z "$gw3" ] && gw3="$gw1"
 
+    local nexthops=""
     [ "$wan1_st" = "online" ] && nexthops="$nexthops nexthop via $gw1 dev eth1 weight 1"
     [ "$wan2_st" = "online" ] && nexthops="$nexthops nexthop via $gw2 dev eth0.2 weight 1"
     [ "$wan3_st" = "online" ] && nexthops="$nexthops nexthop via $gw3 dev eth0.3 weight 1"
@@ -222,24 +238,128 @@ sync_mwan3_multipath() {
     if [ -n "$nexthops" ]; then
         ip route replace default table 50 proto static $nexthops
     else
-        ip route flush table 50
+        ip route flush table 50 2>/dev/null
     fi
 
-    # 确保 fwmark 0x300 指向 Table 50
-    ip rule list | grep -q 'lookup 50' || ip rule add pref 2003 fwmark 0x300/0x3f00 lookup 50
+    ip rule list | grep -q 'lookup 50' || \
+        ip rule add pref 2003 fwmark 0x300/0x3f00 lookup 50
 
-    # 确保 mwan3_policy_balanced 链委托给内核 FIB Multipath 路由
     if [ -n "$(iptables -t mangle -S mwan3_policy_balanced 2>/dev/null)" ]; then
-        if ! iptables -t mangle -C mwan3_policy_balanced -j MARK --set-xmark 0x300/0x3f00 2>/dev/null; then
+        if ! iptables -t mangle -C mwan3_policy_balanced \
+                -j MARK --set-xmark 0x300/0x3f00 2>/dev/null; then
             iptables -t mangle -F mwan3_policy_balanced
-            iptables -t mangle -A mwan3_policy_balanced -j MARK --set-xmark 0x300/0x3f00
+            iptables -t mangle -A mwan3_policy_balanced \
+                -j MARK --set-xmark 0x300/0x3f00
         fi
     fi
 }
 
+sync_web_affinity_policy() {
+    # mwan3 generates this chain from the policy at boot.  When WAN2 was not
+    # online yet it may contain only WAN1, so rebuild it here after both links
+    # are up.  New clients are split 50/50; mwan3's sticky set then keeps each
+    # source IP on the selected WAN.
+    iptables -t mangle -N mwan3_policy_web_affinity 2>/dev/null
+    iptables -t mangle -F mwan3_policy_web_affinity 2>/dev/null
+
+    local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
+    local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
+
+    if [ "$wan1_st" = "online" ] && [ "$wan2_st" = "online" ]; then
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -m statistic --mode random --probability 0.5 \
+            -j MARK --set-xmark 0x200/0x3f00
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -j MARK --set-xmark 0x100/0x3f00
+    elif [ "$wan1_st" = "online" ]; then
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -j MARK --set-xmark 0x100/0x3f00
+    elif [ "$wan2_st" = "online" ]; then
+        iptables -t mangle -A mwan3_policy_web_affinity \
+            -m mark --mark 0x0/0x3f00 \
+            -j MARK --set-xmark 0x200/0x3f00
+    fi
+}
+
+sync_traffic_classification() {
+    command -v ipset >/dev/null 2>&1 || return 0
+
+    # Recent game activity per LAN source, 120 s timeout.
+    ipset -! create game_active hash:ip timeout 120 2>/dev/null
+
+    iptables -t mangle -N WEB_CLASSIFY 2>/dev/null
+    iptables -t mangle -F WEB_CLASSIFY 2>/dev/null
+
+    # 1) Mark sources that recently sent game UDP.  Keep this list to the
+    #    specific game ports; 10000:20000 is too broad and catches normal app
+    #    telemetry.  The game UDP packet itself is still handled by mwan3's
+    #    game_udp / game_high_udp rules (WAN1).
+    iptables -t mangle -A WEB_CLASSIFY \
+        -s 192.168.6.0/24 -p udp \
+        -m multiport --dports 3074,5000:5500,7000:9000,27000:27100 \
+        -j SET --add-set game_active src --exist 2>/dev/null
+
+    # 2) High-concurrency browser/download connections.  Two-stage matching:
+    #    first count total connections per client; then, inside WEB_BULK_CHECK,
+    #    count connections to the same destination.  This avoids putting two
+    #    connlimit matches in one rule (xt_connlimit's combined semantics are
+    #    not reliable on this firmware).
+    iptables -t mangle -N WEB_BULK_CHECK 2>/dev/null
+    iptables -t mangle -F WEB_BULK_CHECK 2>/dev/null
+
+    iptables -t mangle -A WEB_CLASSIFY \
+        -s 192.168.6.0/24 -p tcp -m multiport --dports 80,443 \
+        -m conntrack --ctstate NEW \
+        -m connlimit --connlimit-above 10 --connlimit-saddr \
+        -j WEB_BULK_CHECK
+
+    # A game-active client's new bulk connections go to WAN2.
+    iptables -t mangle -A WEB_BULK_CHECK \
+        -m set --match-set game_active src \
+        -j MARK --set-xmark 0x200/0x3f00
+    iptables -t mangle -A WEB_BULK_CHECK \
+        -m set --match-set game_active src -j RETURN
+
+    # Otherwise only a client with >8 connections to the same destination is
+    # treated as bulk; normal page loads stay on the web sticky policy.
+    iptables -t mangle -A WEB_BULK_CHECK \
+        -m connlimit --connlimit-above 8 --connlimit-daddr \
+        -j MARK --set-xmark 0x300/0x3f00
+    iptables -t mangle -A WEB_BULK_CHECK -j RETURN
+
+    # mwan3_hook starts with CONNMARK --restore-mark, which overwrites any
+    # mark set before it.  Re-save the final class mark after our rules.
+    iptables -t mangle -A WEB_CLASSIFY \
+        -j CONNMARK --save-mark --nfmask 0x3f00 --ctmask 0x3f00
+    iptables -t mangle -A WEB_CLASSIFY -j RETURN
+
+    # Must run AFTER mwan3_hook: mwan3 restores the conntrack mark first, then
+    # our chain overrides the class for bulk/game-active NEW connections.
+    iptables -t mangle -D PREROUTING -j WEB_CLASSIFY 2>/dev/null
+    iptables -t mangle -A PREROUTING -j WEB_CLASSIFY
+}
+
 sync_mwan3_multipath
+sync_web_affinity_policy
+sync_traffic_classification
 EOF
 chmod +x /etc/mwan3.user
+
+# mwan3 的 ifup 事件之后重建 Table 50 / web / bulk / game 分类
+mkdir -p /etc/hotplug.d/iface
+cat << 'EOF' > /etc/hotplug.d/iface/99-mwan3-user
+#!/bin/sh
+case "$ACTION" in
+    ifup|ifdown) ;;
+    *) exit 0 ;;
+esac
+[ -x /etc/mwan3.user ] && /etc/mwan3.user >/dev/null 2>&1
+exit 0
+EOF
+chmod +x /etc/hotplug.d/iface/99-mwan3-user
 
 # 确保防火墙启动/重载时自动调用 /etc/mwan3.user
 if [ -f /etc/firewall.user ]; then
@@ -258,9 +378,10 @@ ipset destroy mwan3_multistream 2>/dev/null || true
 # 7. 重启 mwan3 服务并立即同步
 echo "重启 MWAN3 服务..."
 /etc/init.d/mwan3 enable
-/etc/init.d/mwan3 restart
-sleep 1
-/etc/mwan3.user
+# 该固件的 mwan3 运行时 restart 可能卡在 hotplug 锁；配置在下次重启加载。
+# 同时先手工运行一次 mwan3.user，保证当前会话的 Table 50 不中断。
+/etc/mwan3.user 2>/dev/null || true
+echo "mwan3 配置已写入；请重启路由器以加载 web/bulk/game 规则。"
 
 # 8. 关闭 MTK HNAT/WARP 硬件加速
 # HNAT 会绕过 netfilter/mwan3 缓存 NAPT；双 WAN 同网段时可能在 TCP 20KB

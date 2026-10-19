@@ -1,0 +1,9 @@
+#!/bin/sh
+# Rebuild Table 50 and the web/bulk/game classification after mwan3's
+# 15-mwan3 hook has processed the interface event.
+case "$ACTION" in
+    ifup|ifdown) ;;
+    *) exit 0 ;;
+esac
+[ -x /etc/mwan3.user ] && /etc/mwan3.user >/dev/null 2>&1
+exit 0

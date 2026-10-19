@@ -81,6 +81,8 @@ sh tools/fix_hnat_offload.sh rollback
 
 > **2.0 重构详情**：见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md)。其中记录了 H3C S3110 的 30 秒数据 VLAN 延迟、重复 EAPOL-Start 导致双会话、旧版 30 秒 Logoff 循环的完整抓包证据与验证数据。
 
+- **三类多 WAN 流量**：网页 TCP 80/443 每客户端 sticky 单 WAN；高并发下载回 Table 50 聚合；游戏 UDP 固定 WAN1，游戏期间新下载切 WAN2。详见 [docs/MWAN3_WEB_BULK_GAME.md](docs/MWAN3_WEB_BULK_GAME.md)。
+
 ---
 
 ## 环境要求
@@ -117,7 +119,8 @@ luci-app-sufe-auth/
 │   └── test_sufe_auth.py                  # 协议/配置/恢复序列单元测试
 ├── docs/
 │   ├── HNAT_MULTIWAN_DIAGNOSIS.md         # MTK HNAT 多 WAN 卡死诊断
-│   └── SUFE_AUTH_REFACTOR.md              # 本次认证重构的根因与验证报告
+│   ├── SUFE_AUTH_REFACTOR.md              # 本次认证重构的根因与验证报告
+│   └── MWAN3_WEB_BULK_GAME.md             # 网页单线/下载聚合/游戏保护说明
 ├── tools/
 │   ├── configure_mwan3.sh                 # 实用工具：MWAN3 策略路由一键优化配置脚本
 │   ├── fix_hnat_offload.sh                # 实用工具：关闭 MTK HNAT，修复多 WAN 图片/网页卡死
@@ -214,6 +217,41 @@ make package/luci-app-sufe-auth/compile V=s
    ```bash
    sh tools/configure_mwan3.sh
    ```
+
+---
+
+## 三类流量策略（网页单线 / 下载聚合 / 游戏保护）
+
+在 FIB Multipath Table 50 之上增加固定三类：
+
+| 类别 | 识别 | 出口 |
+| :--- | :--- | :--- |
+| 网页 | LAN TCP 80/443，低并发 | 每客户端 sticky 一条 WAN |
+| 下载 | 同源总并发 >10 且同目标 >8 | mark `0x300` -> Table 50 |
+| 游戏 | UDP 指定游戏端口 | WAN1 |
+| 游戏中的下载 | `game_active` 120 秒 | 新下载 mark `0x200` -> WAN2 |
+| 其他 | 非 80/443 | Table 50 |
+
+部署：
+
+```bash
+sh tools/configure_mwan3.sh
+# 该固件 mwan3 运行时 restart 可能死锁，脚本会提示重启
+reboot
+```
+
+验证：
+
+```bash
+iptables -t mangle -S mwan3_rules
+iptables -t mangle -S mwan3_policy_web_affinity
+iptables -t mangle -S PREROUTING
+ipset list mwan3_sticky_v4_web_sticky
+ipset list game_active
+ip route show table 50
+```
+
+完整说明、阈值、实测结果与边界见 [docs/MWAN3_WEB_BULK_GAME.md](docs/MWAN3_WEB_BULK_GAME.md)。
 
 ---
 
