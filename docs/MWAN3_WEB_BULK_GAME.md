@@ -175,24 +175,20 @@ ip route show table 50
 
 ## 8. 回滚
 
-路由器本地只保留了本次改动前的两个小备份：
+路由器本地测试备份已清理。回滚以 Git 历史为准：
 
 ```text
-/root/mwan3.pre_webclass.20261019_193205
-/root/mwan3.user.pre_webclass.20261019_193205
+4d537a8  ...  6074ff7 / 最新提交
 ```
 
-需要回滚时：
+也可以重新运行 `tools/configure_mwan3.sh` 生成配置。当前生效文件：
 
-```bash
-cp /root/mwan3.pre_webclass.20261019_193205 /etc/config/mwan3
-cp /root/mwan3.user.pre_webclass.20261019_193205 /etc/mwan3.user
-chmod +x /etc/mwan3.user
-reboot
+```text
+/etc/config/mwan3
+/etc/mwan3.user
+/etc/hotplug.d/iface/99-mwan3-user
+/etc/rc.local
 ```
-
-`iptables`/`ipset` 的临时快照已清理；新规则由 `/etc/mwan3.user` 和
-`/etc/hotplug.d/iface/99-mwan3-user` 在启动/ifup 时重建。
 
 ---
 
