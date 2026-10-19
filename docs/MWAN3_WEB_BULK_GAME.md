@@ -46,13 +46,19 @@ config rule 'web_sticky'
 
 规则必须放在 `https` 和 `default_rule` 之前。
 
-网页客户端按 50/50 分散到两条 WAN；`mwan3_sticky_v4_web_sticky` 以
-`(源 IP, mark)` 记住每个客户端的选择，保证同一客户端后续 80/443 连接不再跳
-WAN。
+**网页当前固定 WAN1**。真实 LAN 客户端 `.198` 粘 WAN2 时：
 
-注意：**不要用路由器本机源 `.1/.250` 的 mark 测试来判断 WAN2**。Linux 本机
-OUTPUT 流量在 mangle 打 mark 后不一定会重新选路，会制造“WAN2 大包卡死”的
-假象；真实 LAN 转发路径（PREROUTING/FORWARD）没有这个问题。
+- 百度 HTTPS 小页面 200；
+- WeGame 22KB 页面在 12~15KB 后超时；
+- 104KB 图片 0 字节超时；
+- 同一客户端改粘 WAN1 后，上述三项全部 200，104KB 图片完整返回。
+
+因此 WAN2 的 **forwarded/NAT 大 TLS 响应**确实有问题，WAN2 暂不承载网页；
+WAN2 仍保留给 Table 50 下载和非 80/443 流量。游戏 UDP 本身仍由
+`game_udp` / `game_high_udp` 固定 WAN1。
+
+注意：路由器本机源 `.1/.250` 的 OUTPUT 测试也会制造假象（本机 mark 后不一定
+重新选路），不能单独作为 WAN2 结论；上面的结论来自真实 LAN 转发客户端。
 
 ---
 
@@ -243,34 +249,36 @@ www.wegame.com.cn -> 117.144.242.171 / 117.135.175.100
 
 ---
 
-## 10. Mac 关闭 Wi‑Fi 后经 LAN 无法上网（2026-10-19）
+## 10. Mac/手机网页卡死排查（2026-10-19）
 
-结论：**路由器 LAN/WAN2 没有故障，Mac 侧最终确认 LAN 正常。**
-
-真实测试：
+真实 LAN 客户端测试：
 
 ```text
-Mac en8: 192.168.6.198
-web sticky: 192.168.6.198 -> 0x200 (WAN2)
-关闭 Wi-Fi 后默认路由: 192.168.6.1 dev en8
-ping 192.168.6.1: 0% loss
-ping 223.5.5.5:   0% loss
-nslookup（路由器 192.168.6.1）: 正常
-curl http://www.baidu.com/: HTTP 200
+.198 -> WAN2:
+  HTTP 百度 200
+  HTTPS 百度 200
+  WeGame 22KB: 12~15KB 后超时
+  104KB 图片: 0 字节超时
+
+.198 -> WAN1:
+  HTTP/HTTPS 百度 200
+  WeGame 22KB: 22,541 字节 200
+  104KB 图片: 104,749 字节 200
 ```
 
-排查过程中曾出现“WAN2 + mark 0x200 的 104KB 图片卡在 0 字节”的结论，那是
-**路由器本机源 `.1/.250` 的 OUTPUT 测试伪影**：本机流量在 OUTPUT 打 mark 后
-没有重新选路，不是真实 LAN 转发。真实 `.198 -> WAN2` 的转发路径实测 200。
+因此 WAN2 的 forwarded/NAT 大 TLS 路径有问题，WAN1 正常。已把网页固定到
+WAN1；WAN2 仍用于 Table 50 下载。
 
-因此：
+另一个路由器侧问题是 `game_active` 误判：Mac 的普通 UDP（AirPlay/游戏启动器）
+被游戏端口规则收录，随后浏览器的新连接全部命中 `WEB_BULK_CHECK` 的
+game-active 分支，被强制 mark `0x200` 到 WAN2。日志中 1799 个 bulk 新连接
+全部命中该分支。现已：
 
-- web 策略保持 50/50，`.198` 可以正常粘在 WAN2；
-- `.186/.229` 粘在 WAN1；
-- 如果 Mac 关 Wi-Fi 后仍无法上网，优先检查 Clash TUN 是否真正关闭、默认路由
-  是否变成 `192.168.6.1/en8`、DNS 是否可用，而不是 WAN2。
+- 停用 `game_active` 自动切 WAN2；
+- 清空 `game_active`；
+- 游戏 UDP 仍固定 WAN1；
+- 网页固定 WAN1。
 
-```bash
-route -n get default
-# 应为 gateway 192.168.6.1, interface en8
-```
+手机 `.137` 不在 `game_active` 中，且 WAN1 网关/公网 0% 丢包、路由器 CPU
+空闲；如果手机图片仍失败，需要继续从具体失败 URL/CDN 的 conntrack/PCAP 查，
+而不是继续改 WAN 策略。

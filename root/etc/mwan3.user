@@ -3,7 +3,7 @@
 #
 #   web    : TCP 80/443, low concurrency -> per-client sticky WAN (mwan3)
 #   bulk   : TCP 80/443, >10 total and >8 to one destination -> Table 50 FIB hash
-#   game   : UDP game ports -> WAN1; recent game source -> new bulk to WAN2
+#   game   : UDP game ports -> WAN1 (auto bulk-to-WAN2 disabled)
 #   other  : Table 50 FIB hash
 #
 # This file is sourced by /etc/firewall.user and by the iface hotplug hook.
@@ -50,25 +50,17 @@ sync_mwan3_multipath() {
 }
 
 sync_web_affinity_policy() {
-    # mwan3 generates this chain from the policy at boot.  When WAN2 was not
-    # online yet it may contain only WAN1, so rebuild it here after both links
-    # are up.  New clients are split 50/50; mwan3's sticky set then keeps each
-    # source IP on the selected WAN.
+    # Web traffic is pinned to WAN1. WAN2's forwarded/NAT path currently
+    # stalls on large TLS responses (HTTPS image/page bodies), while WAN1
+    # completes the same transfers. WAN2 remains available for Table 50
+    # downloads and non-web traffic.
     iptables -t mangle -N mwan3_policy_web_affinity 2>/dev/null
     iptables -t mangle -F mwan3_policy_web_affinity 2>/dev/null
 
     local wan1_st=$(cat /var/run/mwan3/iface_state/wan 2>/dev/null)
     local wan2_st=$(cat /var/run/mwan3/iface_state/wan2 2>/dev/null)
 
-    if [ "$wan1_st" = "online" ] && [ "$wan2_st" = "online" ]; then
-        iptables -t mangle -A mwan3_policy_web_affinity \
-            -m mark --mark 0x0/0x3f00 \
-            -m statistic --mode random --probability 0.5 \
-            -j MARK --set-xmark 0x200/0x3f00
-        iptables -t mangle -A mwan3_policy_web_affinity \
-            -m mark --mark 0x0/0x3f00 \
-            -j MARK --set-xmark 0x100/0x3f00
-    elif [ "$wan1_st" = "online" ]; then
+    if [ "$wan1_st" = "online" ]; then
         iptables -t mangle -A mwan3_policy_web_affinity \
             -m mark --mark 0x0/0x3f00 \
             -j MARK --set-xmark 0x100/0x3f00
@@ -82,20 +74,13 @@ sync_web_affinity_policy() {
 sync_traffic_classification() {
     command -v ipset >/dev/null 2>&1 || return 0
 
-    # Recent game activity per LAN source, 120 s timeout.
-    ipset -! create game_active hash:ip timeout 120 2>/dev/null
-
     iptables -t mangle -N WEB_CLASSIFY 2>/dev/null
     iptables -t mangle -F WEB_CLASSIFY 2>/dev/null
 
-    # 1) Mark sources that recently sent game UDP.  Keep this list to the
-    #    specific game ports; 10000:20000 is too broad and catches normal app
-    #    telemetry.  The game UDP packet itself is still handled by mwan3's
-    #    game_udp / game_high_udp rules (WAN1).
-    iptables -t mangle -A WEB_CLASSIFY \
-        -s 192.168.6.0/24 -p udp \
-        -m multiport --dports 3074,5000:5500,7000:9000,27000:27100 \
-        -j SET --add-set game_active src --exist 2>/dev/null
+    # Game-active auto-switch is disabled: normal app UDP (AirPlay/game
+    # launchers) was marking Macs as gaming, and their browser connections
+    # were then forced to WAN2. Game UDP itself still uses mwan3's game_udp /
+    # game_high_udp rules and stays on WAN1.
 
     # 2) High-concurrency browser/download connections.  Two-stage matching:
     #    first count total connections per client; then, inside WEB_BULK_CHECK,
@@ -111,15 +96,8 @@ sync_traffic_classification() {
         -m connlimit --connlimit-above 10 --connlimit-saddr \
         -j WEB_BULK_CHECK
 
-    # A game-active client's new bulk connections go to WAN2.
-    iptables -t mangle -A WEB_BULK_CHECK \
-        -m set --match-set game_active src \
-        -j MARK --set-xmark 0x200/0x3f00
-    iptables -t mangle -A WEB_BULK_CHECK \
-        -m set --match-set game_active src -j RETURN
-
-    # Otherwise only a client with >8 connections to the same destination is
-    # treated as bulk; normal page loads stay on the web sticky policy.
+    # Only a client with >8 connections to the same destination is treated as
+    # bulk; normal page loads stay on the web policy.
     iptables -t mangle -A WEB_BULK_CHECK \
         -m connlimit --connlimit-above 8 --connlimit-daddr \
         -j MARK --set-xmark 0x300/0x3f00
