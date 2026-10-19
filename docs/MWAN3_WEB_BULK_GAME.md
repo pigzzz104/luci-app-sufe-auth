@@ -177,3 +177,26 @@ ip route show table 50
 - 游戏检测依赖端口列表；未列出的游戏不会触发自动切 WAN2，但游戏本身仍走 WAN1。
 - 没有 CAKE/HTB/IFB/tc，无法做精确 12MB/s 限速；游戏时是路径隔离到 WAN2。
 - mwan3 运行时 restart 在这台固件可能卡 hotplug 锁；配置变更后用重启加载。
+
+---
+
+## 8. 回滚
+
+路由器本地只保留了本次改动前的两个小备份：
+
+```text
+/root/mwan3.pre_webclass.20261019_193205
+/root/mwan3.user.pre_webclass.20261019_193205
+```
+
+需要回滚时：
+
+```bash
+cp /root/mwan3.pre_webclass.20261019_193205 /etc/config/mwan3
+cp /root/mwan3.user.pre_webclass.20261019_193205 /etc/mwan3.user
+chmod +x /etc/mwan3.user
+reboot
+```
+
+`iptables`/`ipset` 的临时快照已清理；新规则由 `/etc/mwan3.user` 和
+`/etc/hotplug.d/iface/99-mwan3-user` 在启动/ifup 时重建。
