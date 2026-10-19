@@ -1,30 +1,81 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SUFE Campus Network 802.1X Authentication Daemon
-Specifically created for Shanghai University of Finance and Economics (SUFE)
-Supports:
-  - IEEE 802.1X EAPOL (Unicast & Multicast)
-  - Huawei/H3C EAP-PAP / Allocation (Type 7)
-  - Periodic keep-alive re-auth handling
-  - Physical link carrier monitoring & auto-reconnect
-  - OpenWrt UCI configuration & Procd service management
+SUFE campus network 802.1X authentication daemon.
+
+Clean-room rewrite of the original single-file client.  Design rules:
+
+  * Own exactly one thing: the 802.1X/EAPOL state machine on one interface.
+  * Never change the interface MAC or link state during normal operation.
+  * Never call ``ifup``.  DHCP belongs to netifd/udhcpc; we only nudge udhcpc
+    with SIGUSR1 when a fresh Discover is useful.
+  * Do not send EAPOL-Logoff on SIGTERM/restart by default.  A graceful
+    shutdown must not de-authorize a working campus switch port.
+  * Recovery is an explicit state machine with real timers and exponential
+    backoff.  Physical ports get a long (default 12 s) link-down reset; VLAN
+    ports get Logoff -> settle -> Start because their parent link must not be
+    touched.
+
+UCI schema (backwards compatible with the original plugin):
+
+    config account 'wan'
+        option enable '1'
+        option ifname 'eth1'
+        option network 'wan'
+        option username '...'
+        option password '...'
+        option mac '...'
+        option switch_mac '...'
+
+Optional tuning options (defaults are deliberately conservative):
+
+    option eapol_version '1'          # 1 or 2
+    option logoff_on_stop '0'         # never Logoff just because procd restarts
+    option logoff_on_recovery '0'     # physical ports: link reset clears session
+    option vlan_logoff_on_recovery '1'
+    option dhcp_grace '90'            # seconds to wait for a lease after EAP-Success
+    option auth_timeout '6'
+    option auth_attempts '5'
+    option recovery_settle '10'
+    option recovery_link_down '15'
+    option mac_settle_timeout '30'    # wait for netifd to apply the configured MAC
+    option startup_logoff '1'         # clear a stale switch session once per process
+    option startup_logoff_wait '3'
+    option recovery_link_up_wait '25'
+    option recovery_backoff_max '300'
+
+The procd init script passes only ``-n <section>`` so the password is not
+exposed in ``ps``.
 """
 
-import sys
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
 import os
-import time
+import re
+import select
+import signal
 import socket
 import struct
-import signal
-import syslog
 import subprocess
-import argparse
+import sys
+import syslog
+import time
+from dataclasses import dataclass
+from typing import Optional
 
-ETHERTYPE_EAPOL = 0x888e
+# ---------------------------------------------------------------------------
+# Protocol constants
+# ---------------------------------------------------------------------------
+
+ETHERTYPE_EAPOL = 0x888E
+ETHERTYPE_VLAN = 0x8100
 PAE_GROUP = bytes.fromhex("0180c2000003")
 BROADCAST_MAC = bytes.fromhex("ffffffffffff")
-DEFAULT_SWITCH_MAC = bytes.fromhex("58aea8880c31")
 
 EAPOL_EAPPACKET = 0
 EAPOL_START = 1
@@ -36,476 +87,1126 @@ EAP_SUCCESS = 3
 EAP_FAILURE = 4
 
 EAP_TYPE_ID = 1
+EAP_TYPE_NOTIFICATION = 2
 EAP_TYPE_MD5 = 4
-EAP_TYPE_H3C = 7
+EAP_TYPE_H3C_PAP = 7
 
-running = True
-debug_mode = False
+STATE_INIT = "init"
+STATE_WAIT_LINK = "wait_link"
+STATE_AUTH = "auth"
+STATE_WAIT_DHCP = "wait_dhcp"
+STATE_ONLINE = "online"
+STATE_RECOVER = "recover"
+STATE_BACKOFF = "backoff"
+STATE_STOPPED = "stopped"
 
-current_instance = "default"
+RUNNING = True
+VERBOSE = False
+TAG = "sufe_auth"
 
-# If the gateway itself is unreachable (stale campus switch VLAN/session),
-# bounce the WAN link once to re-trigger 802.1X. Keep a cooldown so a real
-# upstream outage does not flap the port every minute.
-LINK_BOUNCE_COOLDOWN = 300
 
-def log(msg, level=syslog.LOG_INFO):
-    prefix = f"[sufe_auth:{current_instance}] "
-    if debug_mode or not is_daemon:
-        print(prefix + msg, flush=True)
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def monotonic() -> float:
+    return time.monotonic()
+
+
+def wall_time() -> float:
+    return time.time()
+
+
+def log(message: str, level: int = syslog.LOG_INFO) -> None:
+    """Log to syslog and, in verbose mode, to stderr."""
     try:
-        syslog.syslog(level, msg)
+        syslog.syslog(level, message)
     except Exception:
         pass
+    if VERBOSE:
+        print(f"[{TAG}] {message}", flush=True)
 
-def get_uci_option(package, section, option, default=""):
+
+def run_cmd(args, timeout: float = 3.0) -> Optional[subprocess.CompletedProcess]:
     try:
-        res = subprocess.check_output(["uci", "get", f"{package}.{section}.{option}"], stderr=subprocess.DEVNULL)
-        return res.decode("utf-8").strip()
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
     except Exception:
-        return default
-
-def get_mac_bytes(ifname):
-    try:
-        with open(f"/sys/class/net/{ifname}/address", "r") as f:
-            mac_str = f.read().strip()
-            return bytes.fromhex(mac_str.replace(":", ""))
-    except Exception as e:
-        log(f"Failed to read MAC for {ifname}: {e}", syslog.LOG_ERR)
         return None
 
-def set_mac(ifname, mac_str):
+
+def uci_get(section: str, option: str, default: str = "") -> str:
+    """Read a UCI option, falling back to the legacy ``config`` section."""
+    for sec in (section, "config"):
+        if not sec:
+            continue
+        res = run_cmd(["uci", "-q", "get", f"sufe_auth.{sec}.{option}"], timeout=3.0)
+        if res is not None and res.returncode == 0:
+            value = res.stdout.decode("utf-8", "ignore").strip()
+            if value:
+                return value
+    return default
+
+
+def as_bool(value: str, default: bool = False) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "enabled")
+
+
+def as_float(value: str, default: float, minimum: float, maximum: float) -> float:
     try:
-        if not mac_str or not mac_str.strip():
-            return True
-        mac_str = mac_str.strip().lower()
-        curr_mac = get_mac_bytes(ifname)
-        if curr_mac:
-            target_mac = bytes.fromhex(mac_str.replace(":", ""))
-            if curr_mac == target_mac:
-                return True
-        log(f"Setting MAC address of {ifname} to {mac_str}")
-        subprocess.run(["ip", "link", "set", ifname, "down"], check=True)
-        subprocess.run(["ip", "link", "set", ifname, "address", mac_str], check=True)
-        subprocess.run(["ip", "link", "set", ifname, "up"], check=True)
-        time.sleep(2)
-        return True
-    except Exception as e:
-        log(f"Error setting MAC address: {e}", syslog.LOG_ERR)
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def parse_mac(value: str) -> Optional[bytes]:
+    if not value:
+        return None
+    cleaned = value.strip().replace(":", "").replace("-", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{12}", cleaned):
+        return None
+    return bytes.fromhex(cleaned)
+
+
+def mac_to_str(value: Optional[bytes]) -> str:
+    return value.hex(":") if value else ""
+
+
+def read_mac(ifname: str) -> Optional[bytes]:
+    try:
+        with open(f"/sys/class/net/{ifname}/address", "r", encoding="ascii") as handle:
+            return parse_mac(handle.read().strip())
+    except OSError:
+        return None
+
+
+def carrier_up(ifname: str) -> bool:
+    """Return true when the interface (or its VLAN parent) has carrier."""
+    candidates = [ifname]
+    if "." in ifname:
+        candidates.append(ifname.split(".", 1)[0])
+    for name in candidates:
+        try:
+            with open(f"/sys/class/net/{name}/carrier", "r", encoding="ascii") as handle:
+                if handle.read().strip() == "1":
+                    return True
+        except OSError:
+            pass
+    # Some virtual devices do not expose carrier.  Fall back to operstate.
+    try:
+        with open(f"/sys/class/net/{ifname}/operstate", "r", encoding="ascii") as handle:
+            return handle.read().strip() in ("up", "unknown")
+    except OSError:
         return False
 
-def is_carrier_up(ifname):
+
+def interface_exists(ifname: str) -> bool:
+    return os.path.isdir(f"/sys/class/net/{ifname}")
+
+
+def ipv4_address(ifname: str) -> Optional[str]:
+    """Return the first non-link-local IPv4 address of an interface."""
+    res = run_cmd(["ip", "-4", "-o", "addr", "show", "dev", ifname], timeout=3.0)
+    if res is None or res.returncode != 0:
+        return None
+    text = res.stdout.decode("utf-8", "ignore")
+    match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+", text)
+    if not match:
+        return None
+    address = match.group(1)
+    if address.startswith("169.254."):
+        return None
+    return address
+
+
+def default_gateway(network: str, ifname: str) -> Optional[str]:
+    """Find the default gateway, including netifd policy-routing tables."""
+    res = run_cmd(["ubus", "call", f"network.interface.{network}", "status"], timeout=3.0)
+    if res is not None and res.returncode == 0:
+        try:
+            status = json.loads(res.stdout.decode("utf-8", "ignore"))
+            for route in status.get("route", []) or []:
+                if route.get("target") == "0.0.0.0" and str(route.get("mask", "")) == "0":
+                    nexthop = route.get("nexthop")
+                    if nexthop:
+                        return str(nexthop)
+        except (ValueError, TypeError):
+            pass
+
+    res = run_cmd(["ip", "route", "show", "default", "dev", ifname], timeout=3.0)
+    if res is not None and res.returncode == 0:
+        text = res.stdout.decode("utf-8", "ignore")
+        match = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)", text)
+        if match:
+            return match.group(1)
+
+    # Last resort: main routing table in /proc/net/route (hex, little-endian).
     try:
-        with open(f"/sys/class/net/{ifname}/carrier", "r") as f:
-            return f.read().strip() == "1"
-    except Exception:
+        with open("/proc/net/route", "r", encoding="ascii") as handle:
+            next(handle, None)
+            for line in handle:
+                fields = line.split()
+                if len(fields) >= 3 and fields[0] == ifname and fields[1] == "00000000":
+                    packed = struct.pack("<L", int(fields[2], 16))
+                    return socket.inet_ntoa(packed)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def gateway_reachable(gateway: Optional[str], source: Optional[str]) -> bool:
+    """Ping the gateway from the WAN source address.
+
+    ``ping -I eth1`` with no IPv4 address makes BusyBox ARP for the target
+    from the LAN address, which is useless.  Require a real source address.
+    """
+    if not gateway or not source:
         return False
+    res = run_cmd(
+        ["ping", "-c", "1", "-W", "2", "-I", source, gateway],
+        timeout=5.0,
+    )
+    return res is not None and res.returncode == 0
+
+
+def force_dhcp(ifname: str, network: str) -> None:
+    """Ask udhcpc/netifd for a fresh DHCP Discover without touching the link."""
+    pidfile = f"/var/run/udhcpc-{ifname}.pid"
+    signalled = False
+    try:
+        with open(pidfile, "r", encoding="ascii") as handle:
+            pid = int(handle.read().strip())
+        os.kill(pid, signal.SIGUSR1)
+        signalled = True
+        log(f"requested DHCP renew via udhcpc PID {pid}")
+    except (OSError, ValueError):
+        pass
+    if not signalled:
+        run_cmd(["ubus", "call", f"network.interface.{network}", "renew"], timeout=3.0)
+        log("requested DHCP renew via ubus")
+
+
+# ---------------------------------------------------------------------------
+# EAPOL/EAP encoding and parsing (pure functions, unit-tested)
+# ---------------------------------------------------------------------------
+
+def build_eapol(src: bytes, dst: bytes, eapol_type: int, payload: bytes = b"",
+                version: int = 1) -> bytes:
+    return (
+        dst
+        + src
+        + struct.pack("!HBBH", ETHERTYPE_EAPOL, version & 0xFF,
+                       eapol_type & 0xFF, len(payload))
+        + payload
+    )
+
+
+def build_eap_response(eap_id: int, request_type: int, data: bytes = b"") -> bytes:
+    # EAP length covers code + id + length + type + data.
+    return struct.pack("!BBHB", EAP_RESPONSE, eap_id & 0xFF, 5 + len(data),
+                       request_type & 0xFF) + data
+
+
+def build_pap_payload(password: str, username: str) -> bytes:
+    raw_password = password.encode("utf-8")
+    raw_username = username.encode("utf-8")
+    if len(raw_password) > 255:
+        raise ValueError("password is too long for H3C EAP-PAP")
+    return bytes([len(raw_password)]) + raw_password + raw_username
+
+
+def build_md5_payload(eap_id: int, password: str, challenge: bytes,
+                      username: str) -> bytes:
+    digest = hashlib.md5(
+        bytes([eap_id & 0xFF]) + password.encode("utf-8") + challenge
+    ).digest()
+    return bytes([len(digest)]) + digest + username.encode("utf-8")
+
+
+@dataclass
+class Frame:
+    src: bytes
+    dst: bytes
+    eapol_type: int
+    eap_code: Optional[int] = None
+    eap_id: Optional[int] = None
+    eap_type: Optional[int] = None
+    eap_data: bytes = b""
+
+
+def parse_frame(packet: bytes) -> Optional[Frame]:
+    """Parse an Ethernet frame carrying EAPOL, including an optional VLAN tag."""
+    if len(packet) < 14:
+        return None
+    dst = packet[0:6]
+    src = packet[6:12]
+    ethertype = struct.unpack("!H", packet[12:14])[0]
+    offset = 14
+    if ethertype == ETHERTYPE_VLAN:
+        if len(packet) < 18:
+            return None
+        ethertype = struct.unpack("!H", packet[16:18])[0]
+        offset = 18
+    if ethertype != ETHERTYPE_EAPOL or len(packet) < offset + 4:
+        return None
+    _version, eapol_type, eapol_len = struct.unpack("!BBH", packet[offset:offset + 4])
+    body = offset + 4
+    if eapol_type != EAPOL_EAPPACKET:
+        return Frame(src=src, dst=dst, eapol_type=eapol_type)
+    if len(packet) < body + 4:
+        return None
+    eap_code, eap_id, eap_len = struct.unpack("!BBH", packet[body:body + 4])
+    eap_end = min(len(packet), body + eap_len)
+    eap_type = None
+    eap_data = b""
+    if eap_code == EAP_REQUEST and eap_len >= 5 and len(packet) >= body + 5:
+        eap_type = packet[body + 4]
+        eap_data = packet[body + 5:eap_end]
+    return Frame(
+        src=src,
+        dst=dst,
+        eapol_type=eapol_type,
+        eap_code=eap_code,
+        eap_id=eap_id,
+        eap_type=eap_type,
+        eap_data=eap_data,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    section: str
+    ifname: str
+    network: str
+    username: str
+    password: str
+    configured_mac: str = ""
+    switch_mac: Optional[bytes] = None
+    eapol_version: int = 1
+    logoff_on_stop: bool = False
+    logoff_on_recovery: bool = False
+    vlan_logoff_on_recovery: bool = True
+    dhcp_grace: float = 90.0
+    auth_timeout: float = 6.0
+    auth_attempts: int = 5
+    recovery_settle: float = 10.0
+    recovery_link_down: float = 15.0
+    recovery_link_up_wait: float = 25.0
+    recovery_backoff_max: float = 300.0
+    mac_settle_timeout: float = 30.0
+    startup_logoff: bool = True
+    startup_logoff_wait: float = 3.0
+    status_path: str = ""
+
+    @property
+    def is_vlan(self) -> bool:
+        return "." in self.ifname
+
+
+def load_config(section: str, args: argparse.Namespace) -> Config:
+    ifname = args.ifname or uci_get(section, "ifname", "eth1")
+    network = args.network or uci_get(section, "network", "wan")
+    username = args.username or uci_get(section, "username", "")
+    password = args.password or uci_get(section, "password", "")
+    configured_mac = args.mac or uci_get(section, "mac", "")
+    switch_mac_str = args.switch_mac or uci_get(section, "switch_mac", "")
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ifname or ""):
+        raise ValueError(f"invalid interface name: {ifname!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", network or ""):
+        raise ValueError(f"invalid logical network name: {network!r}")
+    if not username or not password:
+        raise ValueError("username and password are required")
+
+    switch_mac = parse_mac(switch_mac_str) if switch_mac_str else None
+    try:
+        eapol_version = int(uci_get(section, "eapol_version", "1"))
+    except ValueError:
+        eapol_version = 1
+    eapol_version = 2 if eapol_version == 2 else 1
+
+    cfg = Config(
+        section=section,
+        ifname=ifname,
+        network=network,
+        username=username,
+        password=password,
+        configured_mac=configured_mac,
+        switch_mac=switch_mac,
+        eapol_version=eapol_version,
+        logoff_on_stop=as_bool(uci_get(section, "logoff_on_stop", "0")),
+        logoff_on_recovery=as_bool(uci_get(section, "logoff_on_recovery", "0")),
+        vlan_logoff_on_recovery=as_bool(uci_get(section, "vlan_logoff_on_recovery", "1")),
+        dhcp_grace=as_float(uci_get(section, "dhcp_grace", "90"), 90.0, 30.0, 600.0),
+        auth_timeout=as_float(uci_get(section, "auth_timeout", "6"), 6.0, 2.0, 30.0),
+        auth_attempts=int(as_float(uci_get(section, "auth_attempts", "5"), 5, 1, 20)),
+        recovery_settle=as_float(uci_get(section, "recovery_settle", "10"),
+                                 10.0, 2.0, 60.0),
+        recovery_link_down=as_float(uci_get(section, "recovery_link_down", "15"),
+                                    15.0, 5.0, 60.0),
+        recovery_link_up_wait=as_float(uci_get(section, "recovery_link_up_wait", "25"),
+                                       25.0, 5.0, 120.0),
+        recovery_backoff_max=as_float(uci_get(section, "recovery_backoff_max", "300"),
+                                      300.0, 60.0, 3600.0),
+        mac_settle_timeout=as_float(uci_get(section, "mac_settle_timeout", "30"),
+                                    30.0, 5.0, 120.0),
+        startup_logoff=as_bool(uci_get(section, "startup_logoff", "1")),
+        startup_logoff_wait=as_float(uci_get(section, "startup_logoff_wait", "3"),
+                                     3.0, 1.0, 30.0),
+    )
+    cfg.status_path = f"/var/run/sufe_auth.{cfg.ifname}.json"
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Authentication client / explicit state machine
+# ---------------------------------------------------------------------------
 
 class SufeAuthClient:
-    def __init__(self, ifname, username, password, target_mac=None, switch_mac=None, network="wan", instance_name=""):
-        global current_instance
-        self.ifname = ifname
-        self.username = username
-        self.password = password
-        self.target_mac = target_mac
-        self.switch_mac = switch_mac or DEFAULT_SWITCH_MAC
-        self.network = network or "wan"
-        self.instance_name = instance_name or ifname
-        current_instance = self.instance_name
-        self.sock = None
-        self.my_mac = None
-        self.is_authenticated = False
-        self.last_auth_time = 0
-        self.last_link_bounce = 0
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sock: Optional[socket.socket] = None
+        self.my_mac: Optional[bytes] = None
+        self.switch_mac = cfg.switch_mac
+        self.switch_mac_learned = False
+        self.need_logoff = cfg.startup_logoff
+        self.state = STATE_INIT
+        self.state_since = monotonic()
+        self.last_rx = 0.0
+        self.last_success = 0.0
+        self.last_error = ""
+        self.auth_attempts = 0
+        self.auth_deadline = 0.0
+        self.auth_next = 0.0
+        self.dhcp_deadline = 0.0
+        self.dhcp_next_kick = 0.0
+        self.dhcp_kicks = 0
+        self.recovery_count = 0
+        self.recovery_step = 0
+        self.recovery_step_at = 0.0
+        self.recovery_not_before = 0.0
+        self.recovery_reason = ""
+        self._last_suppressed_log = 0.0
+        self.backoff_until = 0.0
+        self.online_since = 0.0
+        self.gateway_failures = 0
+        self.next_gateway_check = 0.0
+        self.next_ip_check = 0.0
+        self.mac_warned = False
+        self.mac_wait_since = 0.0
+        self.mac_wait_logged = False
+        self.mac_wait_last_log = 0.0
+        self.mac_drop_logged = False
+        self._last_state_write = 0.0
 
-    def init_socket(self):
-        if self.sock:
+    # -- lifecycle ---------------------------------------------------------
+
+    def set_state(self, state: str, reason: str = "") -> None:
+        if state == self.state:
+            return
+        old = self.state
+        self.state = state
+        self.state_since = monotonic()
+        if state == STATE_WAIT_LINK and old in (STATE_ONLINE, STATE_WAIT_DHCP):
+            # The switch may still hold the old session; clear it once the
+            # link comes back.  Recovery manages its own Logoff/link reset.
+            self.need_logoff = self.cfg.startup_logoff
+        if reason:
+            log(f"state {old} -> {state}: {reason}")
+        else:
+            log(f"state {old} -> {state}")
+        self.write_state(force=True)
+
+    def write_state(self, final_state: Optional[str] = None,
+                    force: bool = False) -> None:
+        now = monotonic()
+        if not force and final_state is None and now - self._last_state_write < 1.0:
+            return
+        self._last_state_write = now
+        payload = {
+            "pid": os.getpid(),
+            "section": self.cfg.section,
+            "ifname": self.cfg.ifname,
+            "network": self.cfg.network,
+            "state": final_state or self.state,
+            "since": wall_time() - (now - self.state_since),
+            "last_success": self.last_success or None,
+            "last_error": self.last_error or None,
+            "recovery_count": self.recovery_count,
+            "recovery_reason": self.recovery_reason or None,
+            "ipv4": ipv4_address(self.cfg.ifname),
+            "mac": mac_to_str(self.my_mac),
+        }
+        tmp = self.cfg.status_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp, self.cfg.status_path)
+        except OSError:
+            pass
+
+    def init_socket(self) -> bool:
+        if not interface_exists(self.cfg.ifname):
+            return False
+        mac = read_mac(self.cfg.ifname)
+        if not mac:
+            return False
+        if self.cfg.configured_mac:
+            wanted = parse_mac(self.cfg.configured_mac)
+            if wanted and wanted != mac:
+                log(
+                    f"interface MAC {mac_to_str(mac)} not yet {self.cfg.configured_mac}; "
+                    "waiting for netifd before authenticating",
+                    syslog.LOG_INFO,
+                )
+        self.close_socket()
+        try:
+            sock = socket.socket(
+                socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETHERTYPE_EAPOL)
+            )
+            sock.bind((self.cfg.ifname, 0))
+            sock.setblocking(False)
+        except OSError as exc:
+            self.last_error = f"socket: {exc}"
+            log(f"cannot open EAPOL socket on {self.cfg.ifname}: {exc}", syslog.LOG_ERR)
+            return False
+        self.sock = sock
+        self.my_mac = mac
+        log(f"EAPOL socket ready on {self.cfg.ifname} (MAC {mac_to_str(mac)})")
+        return True
+
+    def close_socket(self) -> None:
+        if self.sock is not None:
             try:
                 self.sock.close()
-            except Exception:
+            except OSError:
                 pass
             self.sock = None
 
-        if self.target_mac and len(self.target_mac.strip()) > 0:
-            set_mac(self.ifname, self.target_mac.strip())
+    # -- frame transmit ----------------------------------------------------
 
-        self.my_mac = get_mac_bytes(self.ifname)
-        if not self.my_mac:
-            raise RuntimeError(f"Cannot get MAC for {self.ifname}")
+    def current_mac(self) -> Optional[bytes]:
+        # netifd can apply the configured MAC slightly after we start.  Always
+        # use the kernel's current value, otherwise EAPOL responses carry a
+        # stale source MAC and the switch binds the session to the wrong port.
+        mac = read_mac(self.cfg.ifname)
+        if mac:
+            self.my_mac = mac
+        return self.my_mac
 
-        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETHERTYPE_EAPOL))
-        self.sock.bind((self.ifname, 0))
-        self.sock.settimeout(2.0)
-        log(f"Initialized raw socket on {self.ifname} (MAC: {self.my_mac.hex(':')})")
-
-    def send_frame(self, dst_mac, eapol_type, payload=b""):
-        if not self.sock:
+    def send_frame(self, dst: bytes, eapol_type: int, payload: bytes = b"") -> None:
+        if self.sock is None:
             return
-        eth_hdr = dst_mac + self.my_mac + struct.pack("!H", ETHERTYPE_EAPOL)
-        eapol_hdr = struct.pack("!BBH", 1, eapol_type, len(payload))
-        frame = eth_hdr + eapol_hdr + payload
+        src = self.current_mac()
+        if not src:
+            return
+        if not self.mac_matches_config():
+            # Never emit EAPOL with the driver's random boot MAC.  The switch
+            # would bind the 802.1X session/port-security entry to that MAC,
+            # then netifd changes the MAC and DHCP/ARP traffic is dropped.
+            if not self.mac_drop_logged:
+                self.mac_drop_logged = True
+                log(
+                    f"suppressing EAPOL on {self.cfg.ifname}: current MAC "
+                    f"{mac_to_str(src)} != configured {self.cfg.configured_mac}",
+                    syslog.LOG_WARNING,
+                )
+            return
+        self.mac_drop_logged = False
+        frame = build_eapol(src, dst, eapol_type, payload, self.cfg.eapol_version)
         try:
             self.sock.send(frame)
-        except Exception as e:
-            log(f"Error sending frame: {e}", syslog.LOG_ERR)
+        except OSError as exc:
+            if exc.errno not in (errno.ENETDOWN, errno.ENXIO, errno.ENODEV):
+                log(f"EAPOL send failed: {exc}", syslog.LOG_WARNING)
 
-    def send_eap_response(self, dst_mac, pkt_id, req_type, data=b""):
-        eap_len = 5 + len(data)
-        eap_pkt = struct.pack("!BBHB", EAP_RESPONSE, pkt_id, eap_len, req_type) + data
-        self.send_frame(dst_mac, EAPOL_EAPPACKET, eap_pkt)
+    def send_eap_response(self, dst: bytes, eap_id: int, request_type: int,
+                          data: bytes = b"") -> None:
+        self.send_frame(dst, EAPOL_EAPPACKET,
+                        build_eap_response(eap_id, request_type, data))
 
-    def send_start(self):
-        log(f"Sending EAPOL-Start (unicast to {self.switch_mac.hex(':')} & multicast)")
-        self.send_frame(self.switch_mac, EAPOL_START)
-        self.send_frame(PAE_GROUP, EAPOL_START)
-
-    def send_logoff(self):
-        log("Sending EAPOL-Logoff")
-        if self.switch_mac:
-            self.send_frame(self.switch_mac, EAPOL_LOGOFF)
-        self.send_frame(PAE_GROUP, EAPOL_LOGOFF)
-
-    def trigger_dhcp(self):
-        log(f"Authentication successful! Triggering DHCP on interface '{self.network}'...")
-        try:
-            # Never call ifup here: netifd re-applies network.<iface>.macaddr,
-            # which bounces the link and destroys the just-established 802.1X
-            # session, causing an endless auth -> DHCP -> link-reset loop.
-            # ubus renew only asks netifd's udhcpc to renew/discover.
-            subprocess.run(["ubus", "call", f"network.interface.{self.network}", "renew"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            log(f"Failed to trigger DHCP on {self.network}: {e}", syslog.LOG_WARNING)
-
-    def get_gateway(self):
-        try:
-            out = subprocess.check_output(
-                ["ip", "route", "show", "default", "dev", self.ifname],
-                stderr=subprocess.DEVNULL
-            ).decode("utf-8", "ignore")
-            for line in out.splitlines():
-                parts = line.split()
-                if "via" in parts:
-                    return parts[parts.index("via") + 1]
-        except Exception:
-            pass
-        return None
-
-    def gateway_reachable(self):
-        gw = self.get_gateway()
-        if not gw:
-            return None
-        res = subprocess.run(
-            ["ping", "-c", "1", "-W", "2", "-I", self.ifname, gw],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        return res.returncode == 0
-
-    def recover_wan(self):
-        # A campus switch can keep the port in an unauthorized/guest VLAN
-        # after an EAPOL-Logoff or a DHCP NAK. A plain carrier bounce is not
-        # enough; the switch needs a complete Logoff -> wait -> Start cycle.
-        log(f"Forcing EAPOL-Logoff and full re-authentication on {self.ifname}...",
-            syslog.LOG_WARNING)
-        try:
-            self.send_logoff()
-        except Exception:
-            pass
-        time.sleep(10)
-        if "." not in self.ifname:
-            log(f"Bouncing physical link {self.ifname}...", syslog.LOG_WARNING)
-            subprocess.run(["ip", "link", "set", self.ifname, "down"], check=False)
-            time.sleep(2)
-            subprocess.run(["ip", "link", "set", self.ifname, "up"], check=False)
-            time.sleep(3)
+    def send_start(self, multicast: bool = False) -> None:
+        # Exactly one Start per attempt.  Sending unicast + multicast in the
+        # same instant makes an H3C S3110 create two authentication sessions
+        # (two EAP-Request/Identity with different IDs); the stale session later
+        # sends EAP-Failure and de-authorizes the port.  Use unicast when the
+        # switch MAC is known, multicast only as a retry/fallback.
+        if multicast or not self.switch_mac_learned:
+            # First contact uses the standard PAE group address.  A configured
+            # switch MAC is only a hint; H3C ports do not reliably answer a
+            # unicast-triggered Start until the client has been seen.
+            dst = PAE_GROUP
         else:
-            log(f"VLAN interface {self.ifname}: skipping link bounce, EAPOL re-auth only.",
+            dst = self.switch_mac
+        self.send_frame(dst, EAPOL_START)
+        log(f"sent EAPOL-Start to {mac_to_str(dst)}")
+
+    def send_logoff(self) -> None:
+        # One Logoff is enough.  Prefer the learned switch MAC; fall back to
+        # the standard PAE group address.
+        dst = self.switch_mac if self.switch_mac else PAE_GROUP
+        self.send_frame(dst, EAPOL_LOGOFF)
+        log(f"sent EAPOL-Logoff to {mac_to_str(dst)}")
+
+    # -- frame receive / EAP handling -------------------------------------
+
+    def handle_request(self, frame: Frame) -> None:
+        if frame.eap_id is None or frame.eap_type is None:
+            return
+        req_type = frame.eap_type
+        data = frame.eap_data
+        if req_type == EAP_TYPE_ID:
+            self.send_eap_response(frame.src, frame.eap_id, EAP_TYPE_ID,
+                                   self.cfg.username.encode("utf-8"))
+        elif req_type == EAP_TYPE_H3C_PAP:
+            try:
+                payload = build_pap_payload(self.cfg.password, self.cfg.username)
+            except ValueError as exc:
+                self.last_error = str(exc)
+                log(f"cannot build H3C PAP response: {exc}", syslog.LOG_ERR)
+                return
+            self.send_eap_response(frame.src, frame.eap_id, EAP_TYPE_H3C_PAP, payload)
+        elif req_type == EAP_TYPE_MD5:
+            challenge = data[1:17] if len(data) >= 17 else data
+            payload = build_md5_payload(frame.eap_id, self.cfg.password, challenge,
+                                        self.cfg.username)
+            self.send_eap_response(frame.src, frame.eap_id, EAP_TYPE_MD5, payload)
+        elif req_type == EAP_TYPE_NOTIFICATION:
+            log("received EAP-Notification (ignored)")
+        else:
+            log(f"received unsupported EAP-Request type {req_type} (ignored)",
                 syslog.LOG_WARNING)
+
+    def on_success(self, frame: Frame) -> None:
+        self.last_success = wall_time()
+        self.last_error = ""
+        self.gateway_failures = 0
+        if self.state in (STATE_AUTH, STATE_RECOVER):
+            self.auth_attempts = 0
+            self.set_state(STATE_WAIT_DHCP, "EAP-Success")
+            self.dhcp_deadline = monotonic() + self.cfg.dhcp_grace
+            self.dhcp_next_kick = monotonic() + 2.0
+            self.dhcp_kicks = 0
+        elif self.state in (STATE_WAIT_DHCP, STATE_ONLINE):
+            # A repeated EAP-Success must not extend the DHCP grace window;
+            # otherwise a switch that keeps answering could hide a dead port.
+            log(f"switch refreshed authentication (EAP-ID {frame.eap_id})")
+
+    def on_failure(self, frame: Frame) -> None:
+        self.last_error = f"EAP-Failure (ID {frame.eap_id})"
+        log(f"EAP authentication FAILURE (ID {frame.eap_id})", syslog.LOG_ERR)
+        if self.state == STATE_ONLINE:
+            self.set_state(STATE_AUTH, "EAP-Failure while online")
+            self.auth_attempts = 0
+            self.start_auth()
+        elif self.state == STATE_WAIT_DHCP:
+            # A stale H3C session can send Success and then Failure while the
+            # port is still waiting for its data VLAN.  Re-authenticate now;
+            # waiting for the full DHCP grace period would just delay recovery.
+            self.set_state(STATE_AUTH, "EAP-Failure while waiting DHCP")
+            self.auth_attempts = 0
+            self.dhcp_deadline = 0.0
+            self.auth_deadline = 0.0
+            self.auth_next = monotonic() + 3.0
+        elif self.state in (STATE_AUTH, STATE_RECOVER):
+            self.auth_next = monotonic() + 5.0
+            self.auth_deadline = 0.0
+
+    def handle_frame(self, frame: Frame) -> None:
+        self.last_rx = monotonic()
+        if frame.src != self.my_mac:
+            self.switch_mac = frame.src
+            self.switch_mac_learned = True
+        if frame.eapol_type == EAPOL_START:
+            if self.state in (STATE_AUTH, STATE_WAIT_LINK, STATE_BACKOFF):
+                self.start_auth()
+            return
+        if frame.eapol_type == EAPOL_LOGOFF:
+            log("switch sent EAPOL-Logoff; re-authenticating", syslog.LOG_WARNING)
+            self.set_state(STATE_AUTH, "EAPOL-Logoff from switch")
+            self.auth_attempts = 0
+            self.start_auth()
+            return
+        if frame.eapol_type != EAPOL_EAPPACKET or frame.eap_code is None:
+            return
+        if frame.eap_code == EAP_REQUEST:
+            self.handle_request(frame)
+        elif frame.eap_code == EAP_SUCCESS:
+            self.on_success(frame)
+        elif frame.eap_code == EAP_FAILURE:
+            self.on_failure(frame)
+
+    def pump_frames(self, timeout: float = 0.25) -> None:
+        if self.sock is None:
+            time.sleep(min(timeout, 0.2))
+            return
         try:
-            self.init_socket()
-        except Exception as e:
-            log(f"Re-init socket before re-auth failed: {e}", syslog.LOG_WARNING)
-        self.authenticate_loop()
-
-    def authenticate_loop(self):
-        max_attempts = 5
-        attempt = 0
-        self.is_authenticated = False
-
-        while running and attempt < max_attempts:
-            attempt += 1
-            log(f"Authentication attempt {attempt}/{max_attempts}...")
-            self.send_start()
-
-            start_t = time.time()
-            while running and (time.time() - start_t < 6):
-                try:
-                    pkt = self.sock.recv(1600)
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    log(f"Socket recv error: {e}", syslog.LOG_ERR)
-                    break
-
-                if len(pkt) < 18:
-                    continue
-
-                src = pkt[6:12]
-                eth_type = struct.unpack("!H", pkt[12:14])[0]
-                if eth_type != ETHERTYPE_EAPOL or src == self.my_mac:
-                    continue
-
-                self.switch_mac = src
-                version, eapol_type, eapol_len = struct.unpack("!BBH", pkt[14:18])
-                if eapol_type != EAPOL_EAPPACKET or len(pkt) < 22:
-                    continue
-
-                eap_code, eap_id, eap_pkt_len = struct.unpack("!BBH", pkt[18:22])
-                eap_data = pkt[22:18+eap_pkt_len]
-
-                if eap_code == EAP_SUCCESS:
-                    log(f"EAP Authentication SUCCESS! Server ID: {eap_id}")
-                    self.is_authenticated = True
-                    self.last_auth_time = time.time()
-                    self.trigger_dhcp()
-                    return True
-
-                elif eap_code == EAP_FAILURE:
-                    log(f"EAP Authentication FAILURE from switch! ID: {eap_id}", syslog.LOG_ERR)
-                    time.sleep(3)
-                    break
-
-                elif eap_code == EAP_REQUEST:
-                    if len(eap_data) < 1:
-                        continue
-                    req_type = eap_data[0]
-                    req_body = eap_data[1:]
-
-                    if req_type == EAP_TYPE_ID:
-                        log(f"Responding to EAP-Request/Identity with {self.username}")
-                        self.send_eap_response(self.switch_mac, eap_id, EAP_TYPE_ID, self.username.encode("utf-8"))
-
-                    elif req_type == EAP_TYPE_H3C:
-                        log("Responding to EAP-Request/Type 7 (PAP) with password")
-                        pap_payload = bytes([len(self.password)]) + self.password.encode("utf-8") + self.username.encode("utf-8")
-                        self.send_eap_response(self.switch_mac, eap_id, EAP_TYPE_H3C, pap_payload)
-
-                    elif req_type == EAP_TYPE_MD5:
-                        log("Warning: Received EAP-Request/MD5 challenge, replying standard MD5 payload")
-                        # fallback if ever needed
-                        md5_data = req_body[1:17] if len(req_body) > 17 else req_body
-                        import hashlib
-                        m = hashlib.md5(bytes([eap_id]) + self.password.encode("utf-8") + md5_data).digest()
-                        resp = bytes([len(m)]) + m + self.username.encode("utf-8")
-                        self.send_eap_response(self.switch_mac, eap_id, EAP_TYPE_MD5, resp)
-
-                    else:
-                        log(f"Unknown EAP Request Type: {req_type}")
-
-            time.sleep(1)
-
-        return self.is_authenticated
-
-    def monitor_loop(self):
-        log("Entering monitoring & keepalive loop...")
-        last_carrier_check = time.time()
-        last_ping_check = time.time()
-        last_no_ip_check = 0
-        last_keepalive_log = 0
-        fail_count = 0
-
-        while running:
-            # 1. Listen for switch packets (re-authentication requests)
+            readable, _, _ = select.select([self.sock], [], [], max(0.0, timeout))
+        except (OSError, ValueError):
+            return
+        if not readable:
+            return
+        while True:
             try:
-                pkt = self.sock.recv(1600)
-                if len(pkt) >= 22:
-                    src = pkt[6:12]
-                    eth_type = struct.unpack("!H", pkt[12:14])[0]
-                    if eth_type == ETHERTYPE_EAPOL and src != self.my_mac:
-                        eapol_type = pkt[15]
-                        if eapol_type == EAPOL_EAPPACKET:
-                            eap_code, eap_id, eap_pkt_len = struct.unpack("!BBH", pkt[18:22])
-                            eap_data = pkt[22:18+eap_pkt_len]
-                            if eap_code == EAP_REQUEST and len(eap_data) >= 1:
-                                req_type = eap_data[0]
-                                now_t = time.time()
-                                if now_t - last_keepalive_log >= 300:
-                                    last_keepalive_log = now_t
-                                    log(f"Handling periodic EAP-Request heartbeat (ID {eap_id})")
-                                if req_type == EAP_TYPE_ID:
-                                    self.send_eap_response(src, eap_id, EAP_TYPE_ID, self.username.encode("utf-8"))
-                                elif req_type == EAP_TYPE_H3C:
-                                    pap_payload = bytes([len(self.password)]) + self.password.encode("utf-8") + self.username.encode("utf-8")
-                                    self.send_eap_response(src, eap_id, EAP_TYPE_H3C, pap_payload)
-                            elif eap_code == EAP_SUCCESS:
-                                self.is_authenticated = True
-                                self.last_auth_time = time.time()
-            except socket.timeout:
-                pass
-            except Exception as e:
-                log(f"Socket error in monitor: {e}, re-initializing raw socket...", syslog.LOG_WARNING)
-                time.sleep(1)
-                try:
-                    self.init_socket()
-                except Exception as ie:
-                    log(f"Re-init socket error: {ie}", syslog.LOG_WARNING)
-
-            # 2. Check physical carrier every 10 seconds
-            now = time.time()
-            if now - last_carrier_check >= 10:
-                last_carrier_check = now
-                parent_if = self.ifname.split(".")[0] if "." in self.ifname else self.ifname
-                if not is_carrier_up(self.ifname) and not is_carrier_up(parent_if):
-                    log(f"Physical link carrier DOWN on {self.ifname}! Waiting for link...", syslog.LOG_WARNING)
-                    self.is_authenticated = False
-                    while running and not is_carrier_up(self.ifname) and not is_carrier_up(parent_if):
-                        time.sleep(2)
-                    if running:
-                        log(f"Physical link restored on {self.ifname}! Re-authenticating...")
-                        self.init_socket()
-                        self.authenticate_loop()
-                        continue
-
-            # 3. If authenticated but still has no IPv4 after 30s, the switch
-            #    may have kept the port in a guest/unauthorized VLAN (often
-            #    after EAPOL-Logoff or a DHCP NAK). Recover with a full
-            #    Logoff -> wait -> Start cycle, not just an ifup/carrier bounce.
-            if self.is_authenticated and (now - last_no_ip_check >= 10):
-                last_no_ip_check = now
-                has_ip_now = subprocess.run(
-                    f"ip -4 addr show dev {self.ifname} | grep -q 'inet '",
-                    shell=True
-                ).returncode == 0
-                if (not has_ip_now and self.last_auth_time
-                        and (now - self.last_auth_time >= 30)):
-                    if now - self.last_link_bounce >= LINK_BOUNCE_COOLDOWN:
-                        self.last_link_bounce = now
-                        log(f"No IPv4 lease on {self.ifname} after authentication; "
-                            "forcing EAPOL-Logoff and re-authentication...", syslog.LOG_WARNING)
-                        self.recover_wan()
-                        continue
+                packet = self.sock.recv(2048)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                if exc.errno == errno.ENETDOWN:
+                    if self.state == STATE_RECOVER:
+                        # The recovery itself just took the link down (or
+                        # netifd did).  Keep the RECOVER state machine moving;
+                        # aborting here used to shorten the reset to ~3 s.
+                        log("interface down during recovery (expected)",
+                            syslog.LOG_INFO)
+                        self.close_socket()
                     else:
-                        log(f"No IPv4 lease on {self.ifname}, but recovery cooldown is active.",
+                        log("interface went down while receiving",
                             syslog.LOG_WARNING)
-
-            # 4. Check connectivity every 60 seconds
-            if self.is_authenticated and (now - last_ping_check >= 60):
-                last_ping_check = now
-                # Check if interface has an IPv4 address before pinging
-                has_ip = subprocess.run(f"ip -4 addr show dev {self.ifname} | grep -q 'inet '",
-                                        shell=True).returncode == 0
-                if not has_ip:
-                    log(f"{self.ifname} has no IPv4 lease yet, triggering DHCP renew...", syslog.LOG_WARNING)
-                    self.trigger_dhcp()
+                        self.set_state(STATE_WAIT_LINK, "link down")
                 else:
-                    res = subprocess.run(["ping", "-c", "1", "-W", "2", "-I", self.ifname, "223.5.5.5"],
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    if res.returncode == 0:
-                        fail_count = 0
-                    else:
-                        fail_count += 1
-                        log(f"Connectivity check failed ({fail_count}/3)", syslog.LOG_WARNING)
-                        if fail_count >= 3:
-                            log("Connectivity lost! Triggering re-authentication...", syslog.LOG_ERR)
-                            fail_count = 0
-                            gw_ok = self.gateway_reachable()
-                            if gw_ok is False:
-                                now_b = time.time()
-                                if now_b - self.last_link_bounce >= LINK_BOUNCE_COOLDOWN:
-                                    self.last_link_bounce = now_b
-                                    log("Gateway unreachable! Forcing EAPOL-Logoff and "
-                                        "full re-authentication...", syslog.LOG_ERR)
-                                    self.recover_wan()
-                                else:
-                                    log("Gateway unreachable, but recovery cooldown is active; "
-                                        "re-authenticating without logoff.", syslog.LOG_WARNING)
-                                    self.init_socket()
-                                    self.authenticate_loop()
-                            elif gw_ok is None:
-                                log(f"No default gateway found on {self.ifname}; "
-                                    "re-authenticating without link bounce.", syslog.LOG_WARNING)
-                                self.init_socket()
-                                self.authenticate_loop()
-                            else:
-                                # Gateway is fine; the upstream/server path is down.
-                                # Do not logoff/bounce the campus port for this.
-                                self.init_socket()
-                                self.authenticate_loop()
+                    log(f"EAPOL receive error: {exc}", syslog.LOG_WARNING)
+                break
+            frame = parse_frame(packet)
+            if frame is not None:
+                if not self.mac_matches_config():
+                    # Ignore switch heartbeats until netifd has applied the
+                    # account MAC; responding now would bind the session to the
+                    # driver's random MAC.
+                    if not self.mac_drop_logged:
+                        self.mac_drop_logged = True
+                        log(
+                            f"ignoring EAPOL on {self.cfg.ifname} until configured "
+                            f"MAC {self.cfg.configured_mac} is applied",
+                            syslog.LOG_WARNING,
+                        )
+                    continue
+                current = self.current_mac()
+                if not current or frame.src != current:
+                    self.handle_frame(frame)
+            if self.sock is None:
+                break
 
-    def run(self):
-        while running:
-            try:
-                self.init_socket()
-                if self.authenticate_loop():
-                    self.monitor_loop()
+    # -- authentication ----------------------------------------------------
+
+    def mac_matches_config(self) -> bool:
+        """True when the kernel MAC equals the configured/account MAC."""
+        if not self.cfg.configured_mac:
+            return True
+        wanted = parse_mac(self.cfg.configured_mac)
+        if not wanted:
+            return True
+        current = read_mac(self.cfg.ifname)
+        return current == wanted
+
+    def mac_ready(self) -> bool:
+        """Wait for netifd to apply the configured MAC before EAPOL.
+
+        On boot netifd and procd race: eth1 can still carry a random MAC when
+        the daemon starts.  Authenticating with that MAC binds the switch
+        session to the wrong address, then netifd changes the MAC and DHCP is
+        dropped.  Wait indefinitely for the configured value; log every
+        ``mac_settle_timeout`` seconds.  Never fall back to the random MAC.
+        """
+        if not self.cfg.configured_mac:
+            return True
+        wanted = parse_mac(self.cfg.configured_mac)
+        if not wanted:
+            return True
+        current = read_mac(self.cfg.ifname)
+        if current == wanted:
+            self.mac_wait_since = 0.0
+            self.mac_wait_logged = False
+            self.mac_wait_last_log = 0.0
+            return True
+        now = monotonic()
+        if not self.mac_wait_since:
+            self.mac_wait_since = now
+        if (not self.mac_wait_logged or
+                now - self.mac_wait_last_log >= self.cfg.mac_settle_timeout):
+            self.mac_wait_logged = True
+            self.mac_wait_last_log = now
+            log(
+                f"waiting for netifd to apply MAC {self.cfg.configured_mac} "
+                f"on {self.cfg.ifname} (current {mac_to_str(current)})",
+                syslog.LOG_WARNING,
+            )
+        # Never fall back to the driver's random MAC: doing so binds the H3C
+        # session/port-security entry to the wrong address and breaks ARP.
+        return False
+
+    def start_auth(self) -> None:
+        if not self.mac_ready():
+            self.set_state(STATE_WAIT_LINK, "waiting for configured MAC")
+            return
+        if not self.current_mac():
+            self.set_state(STATE_WAIT_LINK, "interface not ready")
+            return
+        if self.need_logoff:
+            # A procd restart or a quick reboot can leave a stale H3C session
+            # behind.  Sending one Logoff and waiting briefly before the first
+            # Start prevents the switch from creating a duplicate session and
+            # then tearing it down with EAP-Failure ~10-25 s later.
+            self.need_logoff = False
+            self.auth_attempts = 0
+            self.auth_deadline = 0.0
+            self.auth_next = monotonic() + self.cfg.startup_logoff_wait
+            self.send_logoff()
+            log(f"startup Logoff sent; waiting "
+                f"{int(self.cfg.startup_logoff_wait)}s before EAPOL-Start")
+            return
+        self.auth_attempts = max(1, self.auth_attempts)
+        log(f"authentication attempt {self.auth_attempts}/{self.cfg.auth_attempts}")
+        # One frame per attempt.  The first contact is multicast; after the
+        # switch has been heard, retries can use its unicast MAC.
+        self.send_start()
+        self.auth_deadline = monotonic() + self.cfg.auth_timeout
+        self.auth_next = 0.0
+
+    def tick_auth(self, now: float) -> None:
+        if not carrier_up(self.cfg.ifname):
+            self.set_state(STATE_WAIT_LINK, "carrier down")
+            return
+        if self.auth_next and now >= self.auth_next:
+            if self.auth_attempts >= self.cfg.auth_attempts:
+                self.set_state(STATE_BACKOFF, "authentication attempts exhausted")
+                self.backoff_until = now + 15.0
+                return
+            self.auth_attempts += 1
+            self.start_auth()
+            return
+        if self.auth_deadline and now >= self.auth_deadline:
+            self.auth_deadline = 0.0
+            if self.auth_attempts >= self.cfg.auth_attempts:
+                self.set_state(STATE_BACKOFF, "authentication attempts exhausted")
+                self.backoff_until = now + 15.0
+            else:
+                self.auth_attempts += 1
+                self.start_auth()
+
+    # -- DHCP / online -----------------------------------------------------
+
+    def tick_wait_dhcp(self, now: float) -> None:
+        if not carrier_up(self.cfg.ifname):
+            self.set_state(STATE_WAIT_LINK, "carrier down")
+            return
+        address = ipv4_address(self.cfg.ifname)
+        if address:
+            self.set_state(STATE_ONLINE, f"DHCP lease {address}")
+            self.online_since = now
+            self.next_gateway_check = now + 60.0
+            self.next_ip_check = now + 5.0
+            self.gateway_failures = 0
+            self.recovery_count = 0
+            return
+        if self.dhcp_next_kick and now >= self.dhcp_next_kick and self.dhcp_kicks < 4:
+            self.dhcp_kicks += 1
+            force_dhcp(self.cfg.ifname, self.cfg.network)
+            self.dhcp_next_kick = now + 20.0
+        if self.dhcp_deadline and now >= self.dhcp_deadline:
+            if now < self.recovery_not_before:
+                # Do not call start_recovery() in a tight loop; retry after a
+                # short penalty.  start_recovery() itself logs the backoff.
+                self.dhcp_deadline = now + 5.0
+                return
+            self.start_recovery(
+                f"no DHCP lease {int(self.cfg.dhcp_grace)}s after EAP-Success"
+            )
+
+    def tick_online(self, now: float) -> None:
+        if not carrier_up(self.cfg.ifname):
+            self.set_state(STATE_WAIT_LINK, "carrier down")
+            return
+        if now >= self.next_ip_check:
+            self.next_ip_check = now + 5.0
+            if not ipv4_address(self.cfg.ifname):
+                log("IPv4 lease disappeared; waiting for DHCP", syslog.LOG_WARNING)
+                self.set_state(STATE_WAIT_DHCP, "lease lost")
+                self.dhcp_deadline = now + 30.0
+                self.dhcp_next_kick = now + 1.0
+                self.dhcp_kicks = 0
+                return
+        if now >= self.next_gateway_check:
+            self.next_gateway_check = now + 60.0
+            address = ipv4_address(self.cfg.ifname)
+            gateway = default_gateway(self.cfg.network, self.cfg.ifname)
+            if address and gateway:
+                if gateway_reachable(gateway, address):
+                    self.gateway_failures = 0
                 else:
-                    log("Authentication failed, retrying in 10 seconds...", syslog.LOG_WARNING)
-                    time.sleep(10)
-            except Exception as e:
-                log(f"Unhandled error in run: {e}", syslog.LOG_ERR)
-                time.sleep(5)
+                    self.gateway_failures += 1
+                    log(
+                        f"gateway {gateway} unreachable "
+                        f"({self.gateway_failures}/3)",
+                        syslog.LOG_WARNING,
+                    )
+                    if self.gateway_failures >= 3:
+                        self.gateway_failures = 0
+                        self.start_recovery(
+                            f"gateway {gateway} unreachable with lease {address}"
+                        )
+        # A long stable online period resets the recovery backoff so a later
+        # transient event starts from a short delay again.
+        if self.recovery_count and now - self.online_since >= 600.0:
+            self.recovery_count = 0
 
-        self.send_logoff()
-        if self.sock:
-            self.sock.close()
-        log("SUFE Auth client terminated.")
+    # -- recovery ----------------------------------------------------------
 
-def sig_handler(signum, frame):
-    global running
-    log(f"Received signal {signum}, stopping...")
-    running = False
+    def start_recovery(self, reason: str) -> None:
+        now = monotonic()
+        if now < self.recovery_not_before:
+            if now - self._last_suppressed_log >= 30.0:
+                self._last_suppressed_log = now
+                log(
+                    f"recovery suppressed ({reason}); next attempt in "
+                    f"{int(self.recovery_not_before - now)}s",
+                    syslog.LOG_WARNING,
+                )
+            return
+        self.recovery_count += 1
+        self.recovery_reason = reason
+        self.recovery_step = 0
+        self.recovery_step_at = now
+        self.set_state(STATE_RECOVER, f"recovery #{self.recovery_count}: {reason}")
+        log(
+            f"recovery #{self.recovery_count} started: {reason}",
+            syslog.LOG_WARNING,
+        )
+        self.need_logoff = False
+        do_logoff = self.cfg.logoff_on_recovery
+        if self.cfg.is_vlan and self.cfg.vlan_logoff_on_recovery:
+            do_logoff = True
+        if do_logoff:
+            self.send_logoff()
+        else:
+            log("not sending EAPOL-Logoff; link reset will clear the session")
 
-is_daemon = False
+    def tick_recovery(self, now: float) -> None:
+        elapsed = now - self.recovery_step_at
+        if self.recovery_step == 0:
+            # Let the switch process Logoff, or simply let the port settle.
+            if elapsed >= self.cfg.recovery_settle:
+                if self.cfg.is_vlan:
+                    self.recovery_step = 3
+                else:
+                    self.recovery_step = 1
+                self.recovery_step_at = now
+            return
+        if self.recovery_step == 1:
+            log(
+                f"physical link reset: {self.cfg.ifname} down for "
+                f"{int(self.cfg.recovery_link_down)}s",
+                syslog.LOG_WARNING,
+            )
+            run_cmd(["ip", "link", "set", self.cfg.ifname, "down"], timeout=3.0)
+            self.recovery_step = 2
+            self.recovery_step_at = now
+            return
+        if self.recovery_step == 2:
+            if elapsed >= self.cfg.recovery_link_down:
+                run_cmd(["ip", "link", "set", self.cfg.ifname, "up"], timeout=3.0)
+                log(f"physical link reset: {self.cfg.ifname} up", syslog.LOG_WARNING)
+                self.recovery_step = 3
+                self.recovery_step_at = now
+            return
+        if self.recovery_step == 3:
+            if carrier_up(self.cfg.ifname) or elapsed >= self.cfg.recovery_link_up_wait:
+                if not carrier_up(self.cfg.ifname):
+                    log("carrier still down after reset; waiting for link",
+                        syslog.LOG_WARNING)
+                self.recovery_step = 4
+                self.recovery_step_at = now
+            return
+        if self.recovery_step == 4:
+            if not self.init_socket():
+                self.set_state(STATE_WAIT_LINK, "interface unavailable after recovery")
+                self.schedule_after_recovery()
+                return
+            self.auth_attempts = 0
+            self.set_state(STATE_AUTH, "recovery complete; re-authenticating")
+            self.start_auth()
+            self.schedule_after_recovery()
+            return
 
-def main():
-    global debug_mode, is_daemon, current_instance
-    parser = argparse.ArgumentParser(description="SUFE Campus Network 802.1X Authenticator")
-    parser.add_argument("-i", "--ifname", help="Network interface (e.g. eth1)")
-    parser.add_argument("-u", "--username", help="Username (e.g. 2023xxxxxx@cmcc)")
-    parser.add_argument("-p", "--password", help="Password")
-    parser.add_argument("-m", "--mac", help="Override MAC address")
-    parser.add_argument("-s", "--switch-mac", help="Switch MAC address")
-    parser.add_argument("-N", "--network", help="OpenWrt logical interface (e.g. wan, wan2)")
-    parser.add_argument("-n", "--name", help="Instance name / Section identifier")
-    parser.add_argument("-d", "--daemon", action="store_true", help="Run as daemon")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debug output")
+    def schedule_after_recovery(self) -> None:
+        delay = min(
+            30.0 * (2 ** max(0, self.recovery_count - 1)),
+            self.cfg.recovery_backoff_max,
+        )
+        self.recovery_not_before = monotonic() + delay
+        log(f"next recovery allowed in {int(delay)}s")
 
+    # -- main loop ---------------------------------------------------------
+
+    def tick(self, now: float) -> None:
+        state = self.state
+        if state == STATE_INIT:
+            if self.init_socket():
+                self.set_state(STATE_WAIT_LINK, "socket initialized")
+            else:
+                self.set_state(STATE_WAIT_LINK, "waiting for interface")
+            return
+        if state == STATE_WAIT_LINK:
+            if carrier_up(self.cfg.ifname):
+                if not self.mac_ready():
+                    return
+                if self.sock is None and not self.init_socket():
+                    return
+                self.auth_attempts = 0
+                self.set_state(STATE_AUTH, "carrier up")
+                self.start_auth()
+            return
+        if state == STATE_AUTH:
+            self.tick_auth(now)
+            return
+        if state == STATE_WAIT_DHCP:
+            self.tick_wait_dhcp(now)
+            return
+        if state == STATE_ONLINE:
+            self.tick_online(now)
+            return
+        if state == STATE_RECOVER:
+            self.tick_recovery(now)
+            return
+        if state == STATE_BACKOFF:
+            if now >= self.backoff_until:
+                self.set_state(STATE_WAIT_LINK, "backoff expired")
+            return
+
+    def run(self) -> None:
+        self.set_state(STATE_INIT, "starting")
+        try:
+            while RUNNING:
+                try:
+                    self.pump_frames(0.25)
+                    self.tick(monotonic())
+                except Exception as exc:  # keep the daemon alive for procd
+                    self.last_error = f"unhandled: {exc}"
+                    log(f"unhandled error: {exc}", syslog.LOG_ERR)
+                    time.sleep(1.0)
+        finally:
+            if self.cfg.logoff_on_stop:
+                self.send_logoff()
+            else:
+                log("shutting down; leaving the 802.1X session intact")
+            self.close_socket()
+            self.write_state(STATE_STOPPED, force=True)
+            log("SUFE auth client terminated")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def acquire_lock(ifname: str):
+    path = f"/var/run/sufe_auth.{ifname}.lock"
+    try:
+        handle = open(path, "a+", encoding="ascii")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+    except OSError:
+        pass
+    return handle
+
+
+def signal_handler(_signum, _frame) -> None:
+    global RUNNING
+    RUNNING = False
+
+
+def print_status(section: str) -> int:
+    ifname = uci_get(section, "ifname", "")
+    if not ifname:
+        print("{}")
+        return 1
+    path = f"/var/run/sufe_auth.{ifname}.json"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            print(handle.read())
+        return 0
+    except OSError:
+        print(json.dumps({"section": section, "ifname": ifname, "state": "not-running"}))
+        return 1
+
+
+def main() -> int:
+    global VERBOSE, TAG
+    parser = argparse.ArgumentParser(description="SUFE 802.1X authentication daemon")
+    parser.add_argument("-n", "--name", default="config", help="UCI account section")
+    parser.add_argument("-i", "--ifname", help="interface name (overrides UCI)")
+    parser.add_argument("-u", "--username", help="username (overrides UCI)")
+    parser.add_argument("-p", "--password", help="password (overrides UCI; debug only)")
+    parser.add_argument("-N", "--network", help="logical network (overrides UCI)")
+    parser.add_argument("-m", "--mac", help="expected MAC (overrides UCI)")
+    parser.add_argument("-s", "--switch-mac", help="switch MAC hint")
+    parser.add_argument("-d", "--daemon", action="store_true",
+                        help=argparse.SUPPRESS)  # accepted for old procd commands
+    parser.add_argument("-v", "--verbose", action="store_true", help="log to stderr")
+    parser.add_argument("--status", action="store_true",
+                        help="print runtime state and exit")
+    parser.add_argument("--version", action="store_true", help="print version and exit")
     args = parser.parse_args()
-    debug_mode = args.verbose
-    is_daemon = args.daemon
 
-    section = args.name or "config"
-    current_instance = args.name or args.ifname or "sufe_auth"
+    if args.version:
+        print("sufe_auth 2.0.0")
+        return 0
+    if args.status:
+        return print_status(args.name)
 
-    syslog.openlog(f"sufe_auth_{current_instance}", syslog.LOG_PID, syslog.LOG_DAEMON)
+    VERBOSE = args.verbose
+    TAG = f"sufe_auth_{args.name}"
+    try:
+        syslog.openlog(TAG, syslog.LOG_PID, syslog.LOG_DAEMON)
+    except Exception:
+        pass
 
-    # Load from UCI if not specified in args
-    ifname = args.ifname or get_uci_option("sufe_auth", section, "ifname", "eth1")
-    username = args.username or get_uci_option("sufe_auth", section, "username")
-    password = args.password or get_uci_option("sufe_auth", section, "password")
-    mac = args.mac or get_uci_option("sufe_auth", section, "mac", "")
-    switch_mac_str = args.switch_mac or get_uci_option("sufe_auth", section, "switch_mac", "58:ae:a8:88:0c:31")
-    network = args.network or get_uci_option("sufe_auth", section, "network", "wan")
+    try:
+        cfg = load_config(args.name, args)
+    except ValueError as exc:
+        log(f"configuration error: {exc}", syslog.LOG_ERR)
+        return 1
 
-    if not username or not password:
-        log("Error: Username and password must be provided via CLI or UCI config!", syslog.LOG_ERR)
-        sys.exit(1)
+    lock = acquire_lock(cfg.ifname)
+    if lock is None:
+        log(f"another sufe_auth instance already owns {cfg.ifname}; exiting",
+            syslog.LOG_WARNING)
+        return 0
 
-    switch_mac = bytes.fromhex(switch_mac_str.replace(":", "")) if switch_mac_str else None
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    signal.signal(signal.SIGINT, sig_handler)
-    signal.signal(signal.SIGTERM, sig_handler)
+    client = SufeAuthClient(cfg)
+    try:
+        client.run()
+    finally:
+        try:
+            lock.close()
+        except OSError:
+            pass
+    return 0
 
-    client = SufeAuthClient(
-        ifname=ifname,
-        username=username,
-        password=password,
-        target_mac=mac,
-        switch_mac=switch_mac,
-        network=network,
-        instance_name=current_instance
-    )
-    client.run()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

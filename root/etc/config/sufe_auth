@@ -1,4 +1,5 @@
 # 上海财经大学校园网认证 - 多线路多账号配置文件
+# 每个 account 对应一个物理/ VLAN 网口和一个逻辑 network。
 config account 'wan'
 	option enable '1'
 	option label '主校园网 (WAN1)'
@@ -8,3 +9,12 @@ config account 'wan'
 	option password ''
 	option mac ''
 	option switch_mac '58:ae:a8:88:0c:31'
+
+# 可选调优项（不写则用默认值，通常不需要改）：
+#	option dhcp_grace '90'             # EAP-Success 后等 DHCP 的秒数
+#	option recovery_link_down '15'     # 物理口恢复时 link down 秒数
+#	option startup_logoff '1'          # 每个进程首次认证前清旧会话
+#	option startup_logoff_wait '3'
+#	option logoff_on_stop '0'          # 停止/重启时不主动发 Logoff
+#	option eapol_version '1'
+#	option mac_settle_timeout '30'     # 等 netifd 套用配置 MAC

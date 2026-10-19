@@ -65,13 +65,21 @@ sh tools/fix_hnat_offload.sh rollback
 ## 功能特性
 
 - **纯原生实现**：基于 Python 3 原生 Socket 封装 IEEE 802.1X EAPOL 协议栈，无第三方扩展库依赖，运行内存占用小（单实例约 10MB）。
-- **协议兼容优化**：适配上财有线网 802.1X (EAP-MD5) 交互流程；针对交换机中途周期性发起的 EAP-Request 心跳重认证进行平滑应答，避免重复握手导致连接波动。
-- **多实例架构**：支持在不同网卡或 VLAN 接口（如 `wan`、`wan2`、`wan3`）上独立运行认证进程，互不影响。
+- **协议兼容优化**：适配上财有线网 802.1X（H3C EAP-PAP Type 7 / EAP-MD5）交互流程；每轮认证只发 **一个** EAPOL-Start，避免 H3C 因单播+组播双 Start 建立重复会话并在稍后回 `EAP-Failure`。
+- **确定性状态机**：`wait_link → auth → wait_dhcp → online → recover` 显式状态机，EAP-Success 后等待 90 秒 DHCP（大于 H3C 约 30 秒的数据 VLAN 放行延迟），不再在 30 秒时误发 Logoff。
+- **安全的恢复策略**：物理口做 15 秒 link reset；VLAN 口只做 Logoff + 重新认证，不触碰 `eth0`，不影响 LAN/WiFi；失败按 30/60/120/240/300 秒退避。
+- **启动会话清理**：每个进程第一次认证前发一次 Logoff 清掉旧会话，等 3 秒再发单组播 Start；停止/重启默认不发 Logoff，避免把正常端口踢下线。
+- **MAC 竞态防护**：不主动改 MAC，认证前等待 netifd 套用配置 MAC；每次发帧重新读取当前 MAC，避免绑定到开机随机 MAC。
+- **多实例架构**：支持在不同网卡或 VLAN 接口（如 `wan`、`wan2`、`wan3`）上独立运行认证进程，互不影响；每接口文件锁防止重复实例。
+- **凭据不进 `ps`**：procd 只传 `-n <section>`，账号密码由守护进程从 UCI 读取。
+- **可观测**：运行状态写入 `/var/run/sufe_auth.<ifname>.json`，可用 `sufe_auth --status -n wan` 查看；日志只记录状态转换和异常，不再每 10 秒刷屏。
 - **LuCI 前端管理**：
   - 卡片式账号管理，支持动态增删线路与账号。
   - 实时显示网线连通性、DHCP IP 获取状态、守护进程 PID 及认证状态。
   - 支持一键平滑重启认证服务。
 - **系统服务守护**：基于 OpenWrt `procd` 进程管理器，支持开机自启、崩溃自动重启与网线插拔重连。
+
+> **2.0 重构详情**：见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md)。其中记录了 H3C S3110 的 30 秒数据 VLAN 延迟、重复 EAPOL-Start 导致双会话、旧版 30 秒 Logoff 循环的完整抓包证据与验证数据。
 
 ---
 
@@ -104,7 +112,12 @@ luci-app-sufe-auth/
 │       │               └── cbi/
 │       │                   └── sufe_auth.lua # LuCI 前端 Web 配置页面
 │       └── sbin/
-│           └── sufe_auth                  # 802.1X 认证核心程序
+│           └── sufe_auth                  # 802.1X 认证核心程序（2.0 状态机）
+├── tests/
+│   └── test_sufe_auth.py                  # 协议/配置/恢复序列单元测试
+├── docs/
+│   ├── HNAT_MULTIWAN_DIAGNOSIS.md         # MTK HNAT 多 WAN 卡死诊断
+│   └── SUFE_AUTH_REFACTOR.md              # 本次认证重构的根因与验证报告
 ├── tools/
 │   ├── configure_mwan3.sh                 # 实用工具：MWAN3 策略路由一键优化配置脚本
 │   ├── fix_hnat_offload.sh                # 实用工具：关闭 MTK HNAT，修复多 WAN 图片/网页卡死
@@ -159,15 +172,15 @@ make package/luci-app-sufe-auth/compile V=s
    - **启用**：勾选后生效。
    - **线路标识**：便于区分的名称（如 `主校园网`、`室友A`）。
    - **物理网卡接口**：填入对应的网卡名（主 WAN 通常为 `eth1`；多路 VLAN 通常为 `eth0.2` 等）。
-   - **关联网络接口**：对应的逻辑网络（如 `wan`、`wan2`），认证通过后会自动触发该接口刷新 DHCP。
+   - **关联网络接口**：对应的逻辑网络（如 `wan`、`wan2`），认证成功后由守护进程通过 `SIGUSR1` 通知 udhcpc 重新发 Discover，不会 `ifup` 或重置链路。
    - **上网账号**：学号/卡号及运营商后缀，例如：
      - 中国移动：`2023xxxxxx@cmcc`
      - 中国电信：`2023xxxxxx@tel`
      - 中国联通：`2023xxxxxx@cnc`
      - 校园内网：`2023xxxxxx`
    - **上网密码**：校园网认证密码。
-   - **物理 MAC 地址**：可选。留空则直接使用网卡自带 MAC；若账号绑定过设备 MAC，填入后将自动完成修改。
-   - **交换机 MAC**：已内置宿舍交换机常用单播地址（`58:ae:a8:88:0c:31`），一般保持默认即可。
+   - **物理 MAC 地址**：**必须填写**，且要与 `/etc/config/network` 的 `config device` / `config interface` 中的 `macaddr` 完全一致。MTK 驱动没有永久 MAC，开机会先生成随机 MAC；守护进程只校验和等待，**MAC 不一致时绝不发任何 EAPOL**，也不会自己改 MAC。netifd 负责套用配置 MAC。
+   - **交换机 MAC**：已内置宿舍交换机常用单播地址（`58:ae:a8:88:0c:31`），一般保持默认即可。首次 Start 使用标准组播地址，收到交换机帧后才会用该单播地址重试。
 3. 点击页面右下角 **【保存并应用】**。
 
 ---
@@ -212,16 +225,22 @@ make package/luci-app-sufe-auth/compile V=s
   ```
 - **查看正在运行的认证进程**：
   ```bash
-  ps | grep sufe_auth
+  ps w | grep '[s]ufe_auth'
+  # 2.0 起只显示 -n wan / -n wan2，不再把密码放进命令行
   ```
-- **命令行单步调试**：
+- **查看运行状态**：
+  ```bash
+  /usr/sbin/sufe_auth --status -n wan
+  cat /var/run/sufe_auth.eth1.json
+  ```
+- **命令行单步调试**（会覆盖 UCI 中的账号密码，仅临时使用）：
   ```bash
   python3 /usr/sbin/sufe_auth -i eth1 -u 账号@cmcc -p 密码 -v
   ```
 
-### 重启后认证成功但 DHCP 拿不到地址
+### 重启后认证成功但 DHCP 拿不到地址（2.0 已重构）
 
-如果日志出现：
+旧版日志：
 
 ```text
 EAP Authentication SUCCESS!
@@ -230,27 +249,33 @@ netifd: Interface 'wan' is disabled
 netifd: wan: Command failed: Permission denied
 ```
 
-这不是账号失败，而是 **`trigger_dhcp()` 调用了 `ifup <network>`**。netifd 会重新套用 `network.<iface>.macaddr`，把刚认证成功的 WAN 链路 down/up，802.1X 会话随之失效，形成“认证成功 → DHCP 失败 → 重认证”的循环。
+旧版根因有三层，详见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md)：
 
-修复：`trigger_dhcp()` 只调用不重置链路的：
+1. `trigger_dhcp()` 曾调用 `ifup`，netifd 重套 MAC、link down/up，打断 802.1X；
+2. H3C S3110 在 EAP-Success 后约 **30 秒**才放行数据 VLAN，旧版正好在 30 秒时
+   执行 `EAPOL-Logoff + eth1 down 2 秒`，把即将放行的会话踢掉，形成 5 分钟循环；
+3. 每轮同时发单播+组播两个 EAPOL-Start，H3C 会建立两个认证会话，稍后回
+   `EAP-Failure`；旧版又忽略 `wait_dhcp` 中的 Failure，无法及时重认证。
+
+2.0 的行为：
+
+- EAP-Success 后等待 **90 秒** DHCP，期间用 `SIGUSR1` 让 udhcpc 重发 Discover；
+- 每轮只发 **一个** EAPOL-Start（首次组播，学到交换机 MAC 后单播）；
+- 每个进程首次认证前发一次 Logoff 清旧会话，等 3 秒再 Start；
+- 物理口恢复做 **15 秒** link reset；VLAN 口只 Logoff + 重认证，不碰 `eth0`；
+- `wait_dhcp` / `online` 收到 EAP-Failure 会立即重认证；
+- 停止/重启默认不发 Logoff；恢复按 30/60/120/240/300 秒退避。
+
+如果上游交换机彻底无响应，仍可手动恢复物理口：
 
 ```bash
-ubus call network.interface.wan renew
+ip link set eth1 down; sleep 15; ip link set eth1 up
 ```
 
-`root/usr/sbin/sufe_auth` 已修正，并加入自动恢复：
+VLAN 口（eth0.2/eth0.3）不要 down 父接口 `eth0`，否则会影响 LAN/WiFi；优先
+`/etc/init.d/sufe_auth restart`，或拔插对应网线。
 
-- 认证成功后 **30 秒仍无 IPv4**，或连续 3 次 **网关不可达**，自动执行
-  `EAPOL-Logoff → 等待 10 秒 → 重新 Start`；
-- 物理口（eth1）额外做一次 link bounce，VLAN 口（eth0.2）只做 EAPOL 重认证，
-  不会把 LAN 一起断掉；
-- 5 分钟冷却，避免上游真故障时反复踢端口。
-
-如果自动恢复因冷却/异常没有生效，再手动执行：
-
-```bash
-ip link set eth1 down; sleep 3; ip link set eth1 up
-```
+> **如果 EAP/DHCP 都成功，但 `ping 10.64.0.1` 仍 100% 丢包、ARP 显示 FAILED**：这是有线校园网网关/端口 ACL/portal 的问题，不是认证脚本能解决的。用另一台设备直插同一墙面端口对比，并联系校园网管理员检查该端口的 802.1X 授权 VLAN、端口安全 sticky MAC 和 DHCP snooping 绑定。详见 [docs/SUFE_AUTH_REFACTOR.md](docs/SUFE_AUTH_REFACTOR.md) 第 9 节。
 
 ---
 
