@@ -92,6 +92,33 @@ http_reach() {
     fi
 }
 
+fetch_check() {
+    # dev url min_bytes label [extra curl args...]
+    dev=$1
+    url=$2
+    min=$3
+    label=$4
+    shift 4
+    out=$(curl -m 20 --interface "$dev" -sS -H "User-Agent: $UA" "$@" -o /dev/null \
+        -w '%{http_code} %{size_download} %{time_total}' "$url" 2>/dev/null)
+    set -- $out
+    code=${1:-000}
+    bytes=${2:-0}
+    t=${3:-0}
+    case "$code" in
+        2*|3*) ;;
+        *)
+            fail "$label via $dev: HTTP $code (${t}s)"
+            return
+            ;;
+    esac
+    if [ "$bytes" -ge "$min" ]; then
+        pass "$label via $dev: HTTP $code ${bytes}B ${t}s"
+    else
+        fail "$label via $dev: only ${bytes}B (need ${min}B)"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 section "1. System"
 UP=$(cut -d. -f1 /proc/uptime 2>/dev/null)
@@ -277,6 +304,115 @@ if [ "$QUICK" -eq 0 ]; then
         fi
     done
 fi
+
+# ---------------------------------------------------------------------------
+section "5c. Covers / images / video nodes"
+
+# Bilibili: cover from the live popular feed, then a 256KB video segment.
+BJ=$(curl -m 10 -sS -H "User-Agent: $UA" \
+    "https://api.bilibili.com/x/web-interface/popular?ps=1&pn=1" 2>/dev/null)
+BPIC=$(printf '%s' "$BJ" | grep -o '"pic":"[^"]*"' | head -1 | cut -d'"' -f4 | \
+    sed 's#^http:#https:#')
+if [ -n "$BPIC" ]; then
+    for dev in eth1 eth0.2; do
+        fetch_check "$dev" "$BPIC" 20000 "bilibili-cover"
+    done
+else
+    warn "bilibili cover URL not found"
+fi
+
+BV=$(printf '%s' "$BJ" | grep -o '"bvid":"[^"]*"' | head -1 | cut -d'"' -f4)
+CID=$(printf '%s' "$BJ" | grep -o '"cid":[0-9]*' | head -1 | cut -d: -f2)
+if [ -n "$BV" ] && [ -n "$CID" ]; then
+    PJ=$(curl -m 10 -sS -H "User-Agent: $UA" -H "Referer: https://www.bilibili.com/" \
+        "https://api.bilibili.com/x/player/playurl?bvid=$BV&cid=$CID&qn=64&fnval=16" 2>/dev/null)
+    VURL=$(printf '%s' "$PJ" | grep -o '"baseUrl":"[^"]*"' | head -1 | \
+        cut -d'"' -f4 | sed 's#\\/#/#g; s/\\u0026/\&/g')
+    if [ -n "$VURL" ]; then
+        for dev in eth1 eth0.2; do
+            fetch_check "$dev" "$VURL" 262144 "bilibili-video-256k" \
+                -r 0-262143 -H "Referer: https://www.bilibili.com/"
+        done
+    else
+        warn "bilibili video URL not found"
+    fi
+else
+    warn "bilibili bvid/cid not found"
+fi
+
+# Zhihu Daily cover
+ZJ=$(curl -m 10 -sS -H "User-Agent: $UA" \
+    "https://daily.zhihu.com/api/4/news/latest" 2>/dev/null)
+ZIMG=$(printf '%s' "$ZJ" | grep -o 'https:\\/\\/[^"]*zhimg[^"]*' | head -1 | \
+    sed 's#\\/#/#g')
+if [ -n "$ZIMG" ]; then
+    for dev in eth1 eth0.2; do
+        fetch_check "$dev" "$ZIMG" 5000 "zhihu-cover"
+    done
+else
+    warn "zhihu cover URL not found"
+fi
+
+# Weibo/Sina image CDN
+SJ=$(curl -m 10 -sS -H "User-Agent: $UA" \
+    "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=1&page=1" 2>/dev/null)
+SIMG=$(printf '%s' "$SJ" | grep -o '"u":"[^"]*"' | head -1 | cut -d'"' -f4 | \
+    sed 's#\\/#/#g; s#^http:#https:#')
+if [ -n "$SIMG" ]; then
+    for dev in eth1 eth0.2; do
+        fetch_check "$dev" "$SIMG" 20000 "weibo-sina-cover"
+    done
+else
+    warn "sina/weibo image URL not found"
+fi
+
+# Taobao banner
+TJ=$(curl -m 10 -sS -H "User-Agent: $UA" "https://www.taobao.com/" 2>/dev/null)
+TIMG=$(printf '%s' "$TJ" | grep -o 'https://img.alicdn.com/[^" ]*' | head -1)
+if [ -n "$TIMG" ]; then
+    for dev in eth1 eth0.2; do
+        fetch_check "$dev" "$TIMG" 20000 "taobao-banner"
+    done
+else
+    warn "taobao image URL not found"
+fi
+
+# Steam cover (Akamai CDN, ~34KB)
+for dev in eth1 eth0.2; do
+    fetch_check "$dev" \
+        "https://cdn.akamai.steamstatic.com/steam/apps/730/header.jpg" \
+        20000 "steam-cover"
+done
+
+# ---------------------------------------------------------------------------
+section "5d. WeChat official account"
+WX_URL="https://mp.weixin.qq.com/s/ZXWzimnS7SQVynOomP6v8g"
+WX_TMP="/tmp/test_network.wx.$$"
+
+for dev in eth1 eth0.2; do
+    fetch_check "$dev" "https://mp.weixin.qq.com/" 20000 "wechat-home"
+done
+
+curl -m 30 --interface eth1 -sS -H "User-Agent: $UA" -o "$WX_TMP" "$WX_URL" 2>/dev/null
+WX_SIZE=$(wc -c < "$WX_TMP" 2>/dev/null)
+WX_SIZE=${WX_SIZE:-0}
+if [ "$WX_SIZE" -ge 200000 ]; then
+    pass "wechat article via eth1: HTML ${WX_SIZE}B"
+else
+    warn "wechat article via eth1: only ${WX_SIZE}B (article may be removed)"
+fi
+fetch_check eth0.2 "$WX_URL" 200000 "wechat-article"
+
+WIMG=$(grep -o 'https://mmbiz.qpic.cn/[^\\"]*' "$WX_TMP" 2>/dev/null | head -1)
+if [ -n "$WIMG" ]; then
+    for dev in eth1 eth0.2; do
+        fetch_check "$dev" "$WIMG" 20000 "wechat-mmbiz-image" \
+            -r 0-262143 -H "Referer: https://mp.weixin.qq.com/"
+    done
+else
+    warn "no mmbiz image found in wechat article"
+fi
+rm -f "$WX_TMP"
 
 # ---------------------------------------------------------------------------
 section "6. Quark / video CDN"

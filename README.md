@@ -129,7 +129,7 @@ luci-app-sufe-auth/
 │   ├── configure_mwan3.sh                 # 实用工具：MWAN3 策略路由一键优化配置脚本
 │   ├── fix_hnat_offload.sh                # 实用工具：关闭 MTK HNAT，修复多 WAN 图片/网页卡死
 │   ├── restore_ipv6.sh                    # 实用工具：一键还原 IPv6 配置
-│   └── test_network.sh                    # 标准化只读回归测试（WAN/DNS/站点/CDN/游戏/分流）
+│   └── test_network.sh                    # 标准化只读回归（WAN/封面/视频/微信/游戏/分流）
 ├── install.sh                             # 路由器一键安装脚本
 ├── uninstall.sh                           # 卸载脚本
 ├── LICENSE                                # MIT 许可证

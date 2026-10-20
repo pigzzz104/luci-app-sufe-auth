@@ -141,8 +141,12 @@ sh tools/test_network.sh --client 192.168.6.216
 ```
 
 退出码为 FAIL 数量，可直接用于脚本化回归。覆盖 WAN 健康、Table 50/SNAT/connected、
-DNS、百度/B 站/知乎/淘宝/京东/QQ/微博/WeGame/5E/LoL CDN/Quark、WAN1/WAN2 吞吐、
-游戏 UDP 规则、每客户端 mark 一致性、日志异常。
+DNS、常用站点/CDN、WAN1/WAN2 吞吐、B 站封面与 256KB 视频分片、知乎/微博(新浪)/
+淘宝/Steam 封面、LoL 17KB/104KB 图片、微信公众号文章 (3.9MB) 与 mmbiz 图片、
+Quark 首页、游戏 UDP 规则、每客户端 mark 一致性、日志异常。
+
+媒体 URL 在运行时从各站 API/HTML 动态提取（B 站热门、知乎日报、新浪滚动、淘宝首页、
+微信文章），不依赖会过期的硬编码图片链接。
 
 手动检查：
 
@@ -358,19 +362,20 @@ mark=512 (0x200), 回程 10.64.4.30, HTTP 200
 
 ## 13. 2026-10-20 标准化回归基线
 
-`tools/test_network.sh` 全量结果：**55 PASS / 3 WARN / 0 FAIL**。
+`tools/test_network.sh` 全量结果：**75 PASS / 1 WARN / 0 FAIL**。
 
 ```text
-WAN1 10.1 MB/s, WAN2 8.2 MB/s   (10MB range, mirrors.aliyun.com)
-LoL 104KB 图片: 两 WAN 均 200
-Quark 首页: 两 WAN 均 200 (42KB)
+WAN1 9.6 MB/s, WAN2 10.2 MB/s   (10MB range, mirrors.aliyun.com)
+B 站封面 430KB / 视频分片 256KB: 两 WAN 均 PASS
+知乎封面 8KB / 微博(新浪)图 170KB / 淘宝 banner 77KB / Steam 封面 34KB: 两 WAN 均 PASS
+LoL 17KB + 104KB: 两 WAN 均 PASS
+微信公众号文章 3.92MB + mmbiz 图片 131KB: 两 WAN 均 PASS
+Quark 首页 42KB: 两 WAN 均 PASS
 Table 50 双 nexthop / SNAT / connected 修复 / HNAT=0 全部 PASS
 ```
 
-3 个 WARN：
+1 个 WARN：
 
-- 手机 `.118` 仍有 1 条 sticky 重掷前的旧 WAN1 连接（应用重开后会消失）；
-- `store.steampowered.com` 在 WAN2 无响应（站点侧，WAN1 也可能超时）；
 - 日志缓冲区内有 1 次 `mwan3track` ping 失败（12:20，未导致接口 offline）。
 
 后续回归直接对比这个基线；出现新的 FAIL 再排查。
