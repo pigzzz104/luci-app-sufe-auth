@@ -132,6 +132,20 @@ reboot
 
 ## 6. 验证命令
 
+标准化只读回归测试（不改配置、不重启）：
+
+```bash
+sh tools/test_network.sh
+sh tools/test_network.sh --quick
+sh tools/test_network.sh --client 192.168.6.216
+```
+
+退出码为 FAIL 数量，可直接用于脚本化回归。覆盖 WAN 健康、Table 50/SNAT/connected、
+DNS、百度/B 站/知乎/淘宝/京东/QQ/微博/WeGame/5E/LoL CDN/Quark、WAN1/WAN2 吞吐、
+游戏 UDP 规则、每客户端 mark 一致性、日志异常。
+
+手动检查：
+
 ```bash
 # web 规则必须在 https 之前
 iptables -t mangle -S mwan3_rules
@@ -339,3 +353,24 @@ mark=512 (0x200), 回程 10.64.4.30, HTTP 200
 
 已有连接不会迁移；LoL 客户端需要完全退出重开，2099/5222 的长连接才会使用
 新的 sticky WAN。`timeout 86400` 在下次重启（mwan3 重建 ipset）后生效。
+
+---
+
+## 13. 2026-10-20 标准化回归基线
+
+`tools/test_network.sh` 全量结果：**55 PASS / 3 WARN / 0 FAIL**。
+
+```text
+WAN1 10.1 MB/s, WAN2 8.2 MB/s   (10MB range, mirrors.aliyun.com)
+LoL 104KB 图片: 两 WAN 均 200
+Quark 首页: 两 WAN 均 200 (42KB)
+Table 50 双 nexthop / SNAT / connected 修复 / HNAT=0 全部 PASS
+```
+
+3 个 WARN：
+
+- 手机 `.118` 仍有 1 条 sticky 重掷前的旧 WAN1 连接（应用重开后会消失）；
+- `store.steampowered.com` 在 WAN2 无响应（站点侧，WAN1 也可能超时）；
+- 日志缓冲区内有 1 次 `mwan3track` ping 失败（12:20，未导致接口 offline）。
+
+后续回归直接对比这个基线；出现新的 FAIL 再排查。
