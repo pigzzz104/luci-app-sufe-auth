@@ -183,9 +183,8 @@ config policy 'web_affinity'
 config rule 'web_sticky'
 	option src_ip '192.168.6.0/24'
 	option proto 'tcp'
-	option dest_port '80,443'
 	option sticky '1'
-	option timeout '3600'
+	option timeout '86400'
 	option use_policy 'web_affinity'
 
 config rule 'https'
@@ -206,10 +205,15 @@ cat << 'EOF' > /etc/mwan3.user
 #!/bin/sh
 # Three-class multi-WAN policy for luci-app-sufe-auth.
 #
-#   web    : TCP 80/443, low concurrency -> per-client sticky WAN (mwan3)
+#   web    : all TCP -> per-client sticky WAN (mwan3)
 #   bulk   : TCP 80/443, >10 total and >8 to one destination -> Table 50 FIB hash
 #   game   : UDP game ports -> WAN1 (auto bulk-to-WAN2 disabled)
 #   other  : Table 50 FIB hash
+#
+# All TCP (not just 80/443) must stay on the client's sticky WAN.  Game
+# clients use TCP 2099/5222-5223/8393-8400 for their lobby/chat session;
+# leaving those on Table 50 put them on a different WAN than the HTTPS
+# login and broke LoL match history / activity pages.
 #
 # This file is sourced by /etc/firewall.user and by the iface hotplug hook.
 # It must stay idempotent: it runs on firewall reload and on every ifup/ifdown.

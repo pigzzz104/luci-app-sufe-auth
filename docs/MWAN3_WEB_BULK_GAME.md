@@ -9,11 +9,11 @@
 
 | 类别 | 识别 | 出口 |
 | :--- | :--- | :--- |
-| 网页 | LAN 源 TCP 80/443，低并发 | mwan3 `web_sticky`：每个源 IP 粘死一条 WAN |
+| 网页/会话 | LAN 源**所有 TCP**（80/443 + 2099/5222-5223/8393-8400 等） | mwan3 `web_sticky`：每个源 IP 粘死一条 WAN |
 | 下载 | 同一源 TCP 80/443 总并发 >10，且同一目标 >8 | mark `0x300` → Table 50 FIB Hash |
 | 游戏 | UDP 3074 / 5000-5500 / 7000-9000 / 27000-27100 | 现有 `game_udp` / `game_high_udp` → WAN1 |
 | 游戏中的下载 | 自动检测 | 暂不启用（游戏 UDP 仍 WAN1） |
-| 其他 | 非上述 | Table 50 / FIB Hash |
+| 其他 | 非 TCP（UDP） | Table 50 / FIB Hash |
 
 标记：
 
@@ -27,26 +27,30 @@ mask   0x3f00
 
 ---
 
-## 2. 网页 sticky
+## 2. 网页/会话 sticky
 
 `/etc/config/mwan3`：
 
 ```uci
 config policy 'web_affinity'
     list use_member 'wan_m1_w1'
+    list use_member 'wan2_m1_w1'
 
 config rule 'web_sticky'
     option src_ip '192.168.6.0/24'
     option proto 'tcp'
-    option dest_port '80,443'
     option sticky '1'
-    option timeout '3600'
+    option timeout '86400'
     option use_policy 'web_affinity'
 ```
 
 规则必须放在 `https` 和 `default_rule` 之前。
 
-**网页按 50/50 分配 WAN1/WAN2**，每个客户端仍只粘一条 WAN，页面内部不会跨线。
+**所有 LAN TCP 按客户端 50/50 分配 WAN1/WAN2**，每个客户端只粘一条 WAN，页面内部和客户端的多个会话端口（2099/5222-5223/8393-8400）不会跨线。
+
+只匹配 80/443 是不够的：LoL 客户端用 TCP 2099（PVP.net）、5222-5223（聊天）、8393-8400（Riot 服务）维持登录态；这些端口落到 Table 50 后会按目的 IP 哈希到另一条 WAN，导致“对战记录/活动页”加载失败。详见第 12 节。
+
+`timeout 86400`（24h）避免客户端休眠 1 小时后 sticky 条目过期、重新 50/50 掷到另一条线。
 
 WAN2 网页路径已用真实手机 `.137` 验证：临时规则下 112 条新 443 连接为
 `mark=0x200`，WAN2 回程 `10.64.3.61` 218 条，最大响应 644,060 字节，页面/
@@ -164,9 +168,9 @@ ip route show table 50
 
 ## 7. 代价与边界
 
-- 网页按客户端 sticky 单 WAN；单个客户端网页下载不聚合，高并发下载通过 bulk 旁路恢复。
+- 所有 TCP 按客户端 sticky 单 WAN；单个客户端网页/非 80/443 TCP 下载不聚合，80/443 高并发下载通过 bulk 旁路恢复。
 - 阈值 10/8 是行为阈值；浏览器极端多标签可能被误判为 bulk。可按需调整。
-- 现有连接不会迁移；规则只影响新连接。
+- 现有连接不会迁移；规则只影响新连接。游戏客户端要完全退出重开，2099/5222 长连接才会切到新的 sticky WAN。
 - 游戏 UDP 固定 WAN1；自动“游戏期间下载切 WAN2”当前关闭。
 - 没有 CAKE/HTB/IFB/tc，无法做精确 12MB/s 限速。
 - mwan3 运行时 restart 在这台固件可能卡 hotplug 锁；配置变更后用重启加载。
@@ -276,3 +280,62 @@ WAN2 是 `eth0.2` VLAN，和 WAN1 共用校园网关。当前使用：
 table 2 的连通路由由 mwan3 自己维护，`mwan3.user` 不再和它争抢；
 WAN2 网页已用真实手机验证。`/etc/rc.local` 在 WAN2 online 后补跑一次
 `mwan3.user`，避免 firewall 刷新掉 SNAT；iface hotplug 也延迟 5 秒。
+
+---
+
+## 12. 2026-10-20 LoL 对战记录/活动页加载失败
+
+### 现象
+
+50/50 网页分流后，LoL 客户端“对战记录”和部分活动页无法加载；游戏对局本身正常。
+
+### 根因
+
+`web_sticky` 当时只匹配 TCP 80/443。LoL 客户端使用：
+
+```text
+TCP 80, 443, 2099 (PVP.net), 5222-5223 (XMPP), 8393-8400 (Riot Client)
+UDP 5000-5500 (game)
+```
+
+2099/5222/8393 不在 sticky 内，走 `mwan3_policy_balanced` → Table 50 →
+按目的 IP 哈希，可能落在另一条 WAN。于是同一客户端的 HTTPS 登录在 sticky
+WAN，PVP.net/聊天在哈希 WAN；服务端看到同一会话两个出口 IP，对战记录/活动页
+校验失败。游戏 UDP 固定 WAN1，所以对局正常。
+
+现场证据（手机 `.118`）：
+
+```text
+443    -> mark 0x200 (WAN2)
+8080   -> mark 0x300 (WAN1)
+993    -> mark 0x300 (WAN1)
+同一目标 49.4.37.98:443 同时存在 0x100 和 0x200
+```
+
+`3600` 的 sticky timeout 只在新建连接时续期；客户端休眠超过 1 小时会重新
+50/50，造成同一会话新旧连接分列两条 WAN。
+
+### 修复
+
+`web_sticky` 从“TCP 80/443”扩为“所有 TCP”，`timeout` 3600 → 86400：
+
+```text
+-A mwan3_rules -s 192.168.6.0/24 -p tcp -m mark --mark 0x0/0x3f00 -j mwan3_rule_web_sticky
+```
+
+游戏 UDP 规则不变，仍固定 WAN1；bulk 规则不变，80/443 高并发下载仍回 Table 50。
+
+### 验证
+
+Mac `.216`（sticky WAN2）新建 TCP 8080：
+
+```text
+mark=512 (0x200), 回程 10.64.4.30, HTTP 200
+```
+
+修复前该连接是 `mark=0x300` → Table 50。
+
+### 注意
+
+已有连接不会迁移；LoL 客户端需要完全退出重开，2099/5222 的长连接才会使用
+新的 sticky WAN。`timeout 86400` 在下次重启（mwan3 重建 ipset）后生效。
