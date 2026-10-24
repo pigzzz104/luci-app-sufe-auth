@@ -180,9 +180,18 @@ config policy 'web_affinity'
 	list use_member 'wan_m1_w1'
 	list use_member 'wan2_m1_w1'
 
+config rule 'game_pc_web'
+	option src_ip '192.168.6.195'
+	option proto 'tcp'
+	option dest_port '80,443'
+	option sticky '1'
+	option timeout '86400'
+	option use_policy 'wan_only'
+
 config rule 'web_sticky'
 	option src_ip '192.168.6.0/24'
 	option proto 'tcp'
+	option dest_port '80,443'
 	option sticky '1'
 	option timeout '86400'
 	option use_policy 'web_affinity'
@@ -205,15 +214,14 @@ cat << 'EOF' > /etc/mwan3.user
 #!/bin/sh
 # Three-class multi-WAN policy for luci-app-sufe-auth.
 #
-#   web    : all TCP -> per-client sticky WAN (mwan3)
+#   web    : TCP 80/443 -> per-client sticky WAN (mwan3)
 #   bulk   : TCP 80/443, >10 total and >8 to one destination -> Table 50 FIB hash
 #   game   : UDP game ports -> WAN1 (auto bulk-to-WAN2 disabled)
 #   other  : Table 50 FIB hash
 #
-# All TCP (not just 80/443) must stay on the client's sticky WAN.  Game
-# clients use TCP 2099/5222-5223/8393-8400 for their lobby/chat session;
-# leaving those on Table 50 put them on a different WAN than the HTTPS
-# login and broke LoL match history / activity pages.
+# Web traffic (80/443) stays on the client's sticky WAN to prevent WAF /
+# credential drops on multi-asset page loads. Downloads and other protocols
+# fall through or get classified to Table 50.
 #
 # This file is sourced by /etc/firewall.user and by the iface hotplug hook.
 # It must stay idempotent: it runs on firewall reload and on every ifup/ifdown.
@@ -322,24 +330,23 @@ sync_traffic_classification() {
     # were then forced to WAN2. Game UDP itself still uses mwan3's game_udp /
     # game_high_udp rules and stays on WAN1.
 
-    # 2) High-concurrency browser/download connections.  Two-stage matching:
-    #    first count total connections per client; then, inside WEB_BULK_CHECK,
-    #    count connections to the same destination.  This avoids putting two
-    #    connlimit matches in one rule (xt_connlimit's combined semantics are
-    #    not reliable on this firmware).
+    # 2) High-concurrency browser/download connections.
+    #    - Branch 1: Single destination bulk (>8 connections to same IP, e.g. Quark / single-server download)
+    #    - Branch 2: Multi-destination bulk (>12 total connections from client, e.g. Steam / multi-CDN download)
     iptables -t mangle -N WEB_BULK_CHECK 2>/dev/null
     iptables -t mangle -F WEB_BULK_CHECK 2>/dev/null
 
     iptables -t mangle -A WEB_CLASSIFY \
         -s 192.168.6.0/24 -p tcp -m multiport --dports 80,443 \
         -m conntrack --ctstate NEW \
-        -m connlimit --connlimit-above 10 --connlimit-saddr \
+        -m connlimit --connlimit-above 10 --connlimit-mask 32 --connlimit-saddr \
         -j WEB_BULK_CHECK
 
-    # Only a client with >8 connections to the same destination is treated as
-    # bulk; normal page loads stay on the web policy.
     iptables -t mangle -A WEB_BULK_CHECK \
-        -m connlimit --connlimit-above 8 --connlimit-daddr \
+        -m connlimit --connlimit-above 8 --connlimit-mask 32 --connlimit-daddr \
+        -j MARK --set-xmark 0x300/0x3f00
+    iptables -t mangle -A WEB_BULK_CHECK \
+        -m connlimit --connlimit-above 12 --connlimit-mask 32 --connlimit-saddr \
         -j MARK --set-xmark 0x300/0x3f00
     iptables -t mangle -A WEB_BULK_CHECK -j RETURN
 

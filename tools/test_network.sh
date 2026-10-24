@@ -213,10 +213,10 @@ else
 fi
 
 if iptables -t mangle -S mwan3_rules 2>/dev/null | \
-        grep -q -- '-p tcp -m mark --mark 0x0/0x3f00 -j mwan3_rule_web_sticky'; then
-    pass "all-TCP web_sticky rule present"
+        grep -q -- '-p tcp -m multiport --dports 80,443 -m mark --mark 0x0/0x3f00 -j mwan3_rule_web_sticky'; then
+    pass "web_sticky rule (80,443) present"
 else
-    fail "all-TCP web_sticky rule missing (only 80/443?)"
+    fail "web_sticky rule (80,443) missing"
 fi
 
 LAST=$(iptables -t mangle -S mwan3_hook 2>/dev/null | tail -1)
@@ -360,7 +360,7 @@ SIMG=$(printf '%s' "$SJ" | grep -o '"u":"[^"]*"' | head -1 | cut -d'"' -f4 | \
     sed 's#\\/#/#g; s#^http:#https:#')
 if [ -n "$SIMG" ]; then
     for dev in eth1 eth0.2; do
-        fetch_check "$dev" "$SIMG" 20000 "weibo-sina-cover"
+        fetch_check "$dev" "$SIMG" 2000 "weibo-sina-cover"
     done
 else
     warn "sina/weibo image URL not found"
