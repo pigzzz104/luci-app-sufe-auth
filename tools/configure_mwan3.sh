@@ -73,6 +73,13 @@ uci commit dhcp
 
 # 5. 备份原 mwan3 配置并写入精简策略
 echo "更新 /etc/config/mwan3 策略配置..."
+GAME_PC_IP="${1:-$GAME_PC_IP}"
+if [ -z "$GAME_PC_IP" ] && [ -t 0 ]; then
+    printf "\n[可选配置] 是否有特定游戏主机需锁定走优质游戏线路 (WAN1)?\n"
+    printf "(可彻底根除英雄联盟等游戏的大厅与对局公网 IP 分裂，留空直接回车跳过): "
+    read -r input_ip
+    GAME_PC_IP="$input_ip"
+fi
 if [ -f /etc/config/mwan3 ]; then
     cp -p /etc/config/mwan3 "/etc/config/mwan3.bak.$(date +%Y%m%d_%H%M%S)"
 fi
@@ -179,14 +186,23 @@ config rule 'game_high_udp'
 config policy 'web_affinity'
 	list use_member 'wan_m1_w1'
 	list use_member 'wan2_m1_w1'
+EOF
+
+if [ -n "$GAME_PC_IP" ]; then
+    echo "为游戏主机 $GAME_PC_IP 写入专属 WAN1 策略..."
+    cat << EOF >> /etc/config/mwan3
 
 config rule 'game_pc_web'
-	option src_ip '192.168.6.195'
+	option src_ip '$GAME_PC_IP'
 	option proto 'tcp'
 	option dest_port '80,443'
 	option sticky '1'
 	option timeout '86400'
 	option use_policy 'wan_only'
+EOF
+fi
+
+cat << 'EOF' >> /etc/config/mwan3
 
 config rule 'web_sticky'
 	option src_ip '192.168.6.0/24'
