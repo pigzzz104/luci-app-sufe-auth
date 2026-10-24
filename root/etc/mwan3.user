@@ -1,19 +1,23 @@
 #!/bin/sh
 # Three-class multi-WAN policy for luci-app-sufe-auth.
 #
-#   web    : TCP 80/443 -> per-client sticky WAN (mwan3)
-#   bulk   : TCP 80/443, >10 total and >8 to one destination -> Table 50 FIB hash
-#   game   : UDP game ports -> WAN1 (auto bulk-to-WAN2 disabled)
+#   game   : UDP game ports & TCP control ports (1119, 3724, 2099, etc.) -> WAN1
+#   web    : TCP 443 -> per-client sticky WAN (mwan3 web_affinity)
+#   bulk   : TCP 80, Netdisk domains (ipset), & single-IP (>4 conns) -> CLASSIFY_BULK (50/50 dual-line)
+#   campus : 10.0.0.0/8 intranet -> single-line sticky
 #   other  : Table 50 FIB hash
 #
-# Web traffic (80/443) stays on the client's sticky WAN to prevent WAF /
-# credential drops on multi-asset page loads. Downloads and other protocols
-# fall through or get classified to Table 50.
+# Web traffic (443) stays on the client's sticky WAN to prevent WAF /
+# credential drops on multi-asset page loads and prevent video player buffer
+# stalls. Downloads (Steam on 80, netdisks via ipset) route to CLASSIFY_BULK.
 #
 # This file is sourced by /etc/firewall.user and by the iface hotplug hook.
 # It must stay idempotent: it runs on firewall reload and on every ifup/ifdown.
 
 LOG="logger -t mwan3-user"
+
+# Ensure multistream ipset exists for dnsmasq and iptables
+ipset create mwan3_multistream hash:ip hashsize 1024 maxelem 65536 2>/dev/null || true
 
 sync_mwan3_multipath() {
     sysctl -w net.ipv4.fib_multipath_hash_policy=0 >/dev/null 2>&1
@@ -111,36 +115,59 @@ sync_mwan3_connected_fix() {
 sync_traffic_classification() {
     iptables -t mangle -N WEB_CLASSIFY 2>/dev/null
     iptables -t mangle -F WEB_CLASSIFY 2>/dev/null
-
-    # Game-active auto-switch is disabled: normal app UDP (AirPlay/game
-    # launchers) was marking Macs as gaming, and their browser connections
-    # were then forced to WAN2. Game UDP itself still uses mwan3's game_udp /
-    # game_high_udp rules and stays on WAN1.
-
-    # 2) High-concurrency browser/download connections.
-    #    - Branch 1: Single destination bulk (>8 connections to same IP, e.g. Quark / single-server download)
-    #    - Branch 2: Multi-destination bulk (>12 total connections from client, e.g. Steam / multi-CDN download)
-    iptables -t mangle -N WEB_BULK_CHECK 2>/dev/null
     iptables -t mangle -F WEB_BULK_CHECK 2>/dev/null
+    iptables -t mangle -X WEB_BULK_CHECK 2>/dev/null
 
-    iptables -t mangle -A WEB_CLASSIFY \
-        -s 192.168.6.0/24 -p tcp -m multiport --dports 80,443 \
-        -m conntrack --ctstate NEW \
-        -m connlimit --connlimit-above 10 --connlimit-mask 32 --connlimit-saddr \
-        -j WEB_BULK_CHECK
-
-    iptables -t mangle -A WEB_BULK_CHECK \
-        -m connlimit --connlimit-above 8 --connlimit-mask 32 --connlimit-daddr \
-        -j MARK --set-xmark 0x300/0x3f00
-    iptables -t mangle -A WEB_BULK_CHECK \
-        -m connlimit --connlimit-above 12 --connlimit-mask 32 --connlimit-saddr \
-        -j MARK --set-xmark 0x300/0x3f00
-    iptables -t mangle -A WEB_BULK_CHECK -j RETURN
-
-    # mwan3_hook starts with CONNMARK --restore-mark, which overwrites any
-    # mark set before it.  Re-save the final class mark after our rules.
-    iptables -t mangle -A WEB_CLASSIFY \
+    # Helper chain: 50/50 per-connection load balancing across WAN1 and WAN2
+    # Bypasses Table 50 L3 hash so even multiple connections to the same host IP
+    # are evenly split across both WAN interfaces.
+    iptables -t mangle -N CLASSIFY_BULK 2>/dev/null
+    iptables -t mangle -F CLASSIFY_BULK 2>/dev/null
+    iptables -t mangle -A CLASSIFY_BULK -j MARK --set-xmark 0x0/0x3f00
+    iptables -t mangle -A CLASSIFY_BULK \
+        -m statistic --mode random --probability 0.5 \
+        -j MARK --set-xmark 0x200/0x3f00
+    iptables -t mangle -A CLASSIFY_BULK \
+        -m mark --mark 0x0/0x3f00 \
+        -j MARK --set-xmark 0x100/0x3f00
+    iptables -t mangle -A CLASSIFY_BULK \
         -j CONNMARK --save-mark --nfmask 0x3f00 --ctmask 0x3f00
+    iptables -t mangle -A CLASSIFY_BULK -j RETURN
+
+    # 1) Campus intranet exemption: keep 10.0.0.0/8 on sticky/single line
+    iptables -t mangle -A WEB_CLASSIFY -d 10.0.0.0/8 -j RETURN
+
+    # 2) Dedicated game PC exemption: respect mwan3's game_pc_web rule if configured
+    local game_pc_ip
+    game_pc_ip=$(uci -q get mwan3.game_pc_web.src_ip)
+    [ -n "$game_pc_ip" ] && iptables -t mangle -A WEB_CLASSIFY -s "$game_pc_ip" -j RETURN
+
+    # 3) Bulk HTTP port 80 download (SteamPipe, Windows Update, CDN chunks).
+    #    Normal web browsing is 100% HTTPS (443). Port 80 is used for unencrypted
+    #    bulk chunk downloads and brief 301/302 redirects.
+    iptables -t mangle -A WEB_CLASSIFY \
+        -s 192.168.6.0/24 -p tcp --dport 80 \
+        -m conntrack --ctstate NEW \
+        -j CLASSIFY_BULK
+
+    # 4) Multistream download acceleration (Quark, Baidu Wangpan, Speedtest via ipset).
+    #    Populated cleanly by dnsmasq without guessing connection thresholds or breaking Bilibili.
+    if ipset list mwan3_multistream >/dev/null 2>&1; then
+        iptables -t mangle -A WEB_CLASSIFY \
+            -s 192.168.6.0/24 -p tcp \
+            -m set --match-set mwan3_multistream dst \
+            -m conntrack --ctstate NEW \
+            -j CLASSIFY_BULK
+    fi
+
+    # 5) Multi-threaded HTTPS downloads to same single IP (>4 connections to exact same IP):
+    #    Single-host download acceleration (IDM, Thunder, Aria2).
+    iptables -t mangle -A WEB_CLASSIFY \
+        -s 192.168.6.0/24 -p tcp --dport 443 \
+        -m conntrack --ctstate NEW \
+        -m connlimit --connlimit-above 4 --connlimit-mask 32 --connlimit-daddr \
+        -j CLASSIFY_BULK
+
     iptables -t mangle -A WEB_CLASSIFY -j RETURN
 
     # Must run AFTER mwan3_hook: mwan3 restores the conntrack mark first, then
